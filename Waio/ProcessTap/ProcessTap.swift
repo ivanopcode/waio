@@ -228,7 +228,11 @@ final class ProcessTapRecorder {
             throw "Failed to create AVAudioFormat."
         }
         
-        logger.info("Using audio format: \(format, privacy: .public)")
+        logger.info("""
+            🟣 Stream format detected – sampleRate: \(Int(format.sampleRate), privacy: .public) Hz, \
+            channels: \(format.channelCount, privacy: .public), \
+            interleaved: \(format.isInterleaved, privacy: .public)
+            """)
         
         // Prepare file for writing
         let settings: [String: Any] = [
@@ -258,7 +262,7 @@ final class ProcessTapRecorder {
             let ch  = buffer.format.channelCount
             if sr != self.lastSampleRate || ch != self.lastChannelCount {
                 self.logger.info("""
-                    🟣 New buffer format detected – sampleRate: \(sr, privacy: .public) Hz, \
+                    🟣 Stream format detected – sampleRate: \(Int(sr), privacy: .public) Hz, \
                     channels: \(ch, privacy: .public), \
                     frames: \(buffer.frameLength, privacy: .public)
                     """)
