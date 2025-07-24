@@ -227,6 +227,8 @@ final class ProcessTapRecorder {
     // MARK: Private
     
     private let queue  = DispatchQueue(label: "ProcessTapRecorder", qos: .userInitiated)
+    /// Serial queue dedicated to non‑real‑time file I/O
+    private let writerQueue = DispatchQueue(label: "ProcessTapRecorder.Writer", qos: .utility)
     private let logger: Logger
     
     @ObservationIgnored private weak var _tap: ProcessTap?
@@ -313,11 +315,41 @@ final class ProcessTapRecorder {
             self.lastHostTime = thisHostTime
             // -----------------------------------------------------------------------
             
+            // Deep‑copy the no‑copy buffer so its memory is valid outside the RT callback
+            guard
+                let ownedBuffer = AVAudioPCMBuffer(pcmFormat: format,
+                                                   frameCapacity: buffer.frameCapacity)
+            else { return }
             
-            do {
-                try currentFile.write(from: buffer)
-            } catch {
-                self.logger.error("File write error: \(error, privacy: .public)")
+            ownedBuffer.frameLength = buffer.frameLength
+            // Explicit memcpy of sample data for compatibility with all SDKs
+            if format.isInterleaved {
+                // Interleaved: all channels stored sequentially in one buffer
+                if let src = buffer.floatChannelData?[0],
+                   let dst = ownedBuffer.floatChannelData?[0] {
+                    let byteCount = Int(buffer.frameLength) *
+                    Int(format.channelCount) *
+                    MemoryLayout<Float>.size
+                    memcpy(dst, src, byteCount)
+                }
+            } else {
+                // Non‑interleaved (planar): copy channel‑by‑channel
+                for ch in 0 ..< Int(format.channelCount) {
+                    if let src = buffer.floatChannelData?[ch],
+                       let dst = ownedBuffer.floatChannelData?[ch] {
+                        let byteCount = Int(buffer.frameLength) * MemoryLayout<Float>.size
+                        memcpy(dst, src, byteCount)
+                    }
+                }
+            }
+            
+            // Offload disk I/O to the writer queue to keep the audio callback real‑time safe
+            self.writerQueue.sync { [logger = self.logger] in
+                do {
+                    try currentFile.write(from: ownedBuffer)
+                } catch {
+                    logger.error("File write error: \(error, privacy: .public)")
+                }
             }
         } invalidationHandler: { [weak self] _ in
             self?.handleInvalidation()
