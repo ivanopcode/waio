@@ -232,10 +232,6 @@ final class ProcessTapRecorder {
     @ObservationIgnored private weak var _tap: ProcessTap?
     @ObservationIgnored private var currentFile: AVAudioFile?
     
-    // Track last-seen format to avoid spamming the console
-    @ObservationIgnored private var lastSampleRate: Double?
-    @ObservationIgnored private var lastChannelCount: AVAudioChannelCount?
-    
     private(set) var isRecording = false
     
     // MARK: Init
@@ -317,19 +313,6 @@ final class ProcessTapRecorder {
             self.lastHostTime = thisHostTime
             // -----------------------------------------------------------------------
             
-            // -----------   Log New buffer format  -----------
-            let sr  = buffer.format.sampleRate
-            let ch  = buffer.format.channelCount
-            if sr != self.lastSampleRate || ch != self.lastChannelCount {
-                self.logger.info("""
-                    🟣 Stream format detected – sampleRate: \(Int(sr), privacy: .public) Hz, \
-                    channels: \(ch, privacy: .public), \
-                    frames: \(buffer.frameLength, privacy: .public)
-                    """)
-                self.lastSampleRate   = sr
-                self.lastChannelCount = ch
-            }
-            // --------------------------------------
             
             do {
                 try currentFile.write(from: buffer)
