@@ -344,7 +344,7 @@ final class ProcessTapRecorder {
             }
             
             // Offload disk I/O to the writer queue to keep the audio callback real‑time safe
-            self.writerQueue.sync { [logger = self.logger] in
+            self.writerQueue.async { [logger = self.logger] in
                 do {
                     try currentFile.write(from: ownedBuffer)
                 } catch {
