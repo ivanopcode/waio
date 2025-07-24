@@ -88,7 +88,7 @@ final class AudioProcessController {
 
                     #if DEBUG
                     if UserDefaults.standard.bool(forKey: "ACDumpProcessInfo") {
-                        logger.debug("[PROCESS] \(String(describing: proc))")
+                        //. logger.debug("[PROCESS] \(String(describing: proc))")
                     }
                     #endif
 

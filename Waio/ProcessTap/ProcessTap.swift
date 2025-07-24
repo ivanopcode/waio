@@ -29,6 +29,13 @@ final class ProcessTap {
     @ObservationIgnored private(set) var tapStreamDescription: AudioStreamBasicDescription?
     @ObservationIgnored private var invalidationHandler: InvalidationHandler?
     
+    @ObservationIgnored private var formatListenerAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioTapPropertyFormat,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    @ObservationIgnored private var formatListenerBlock: AudioObjectPropertyListenerBlock?
+    
     @ObservationIgnored private(set) var activated = false
     
     // MARK: Lifecycle
@@ -74,6 +81,15 @@ final class ProcessTap {
                 logger.warning("Failed to destroy aggregate device: \(err, privacy: .public)")
             }
             aggregateDeviceID = .unknown
+        }
+        
+        if let block = formatListenerBlock {
+            var addr = formatListenerAddress
+            let err = AudioObjectRemovePropertyListenerBlock(processTapID, &addr, DispatchQueue.main, block)
+            if err != noErr {
+                logger.warning("Failed to remove format listener: \(err)")
+            }
+            formatListenerBlock = nil
         }
         
         if processTapID.isValid {
@@ -128,6 +144,7 @@ final class ProcessTap {
         ]
         
         self.tapStreamDescription = try tapID.readAudioTapStreamBasicDescription()
+        registerFormatChangeListener()
         
         aggregateDeviceID = .unknown
         err = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateDeviceID)
@@ -161,6 +178,29 @@ final class ProcessTap {
         guard err == noErr else { throw "Failed to start audio device: \(err)" }
     }
     
+    // MARK: Format‑change monitoring
+    private func registerFormatChangeListener() {
+        guard processTapID.isValid else { return }
+        
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            do {
+                let newDesc = try self.processTapID.readAudioTapStreamBasicDescription()
+                self.tapStreamDescription = newDesc
+                self.logger.info("🔄 Tap format changed – sampleRate: \(Int(newDesc.mSampleRate)) Hz, channels: \(newDesc.mChannelsPerFrame)")
+            } catch {
+                self.logger.error("Failed to read format on change: \(error)")
+            }
+        }
+        formatListenerBlock = block
+        
+        var addr = formatListenerAddress
+        let err = AudioObjectAddPropertyListenerBlock(processTapID, &addr, DispatchQueue.main, block)
+        if err != noErr {
+            logger.warning("Failed to add format listener: \(err)")
+        }
+    }
+    
     deinit { invalidate() }
 }
 
@@ -168,6 +208,16 @@ final class ProcessTap {
 
 @Observable
 final class ProcessTapRecorder {
+    
+    // Persistent timing state for effective‑sample‑rate measurement
+    @ObservationIgnored private var lastHostTime: UInt64 = 0
+    
+    // Mach‑time tick conversion factor
+    private static let hostTicksPerSecond: Double = {
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        return 1_000_000_000.0 * Double(tb.denom) / Double(tb.numer)
+    }()
     
     // MARK: Public API
     
@@ -256,6 +306,16 @@ final class ProcessTapRecorder {
                                               bufferListNoCopy: inInputData,
                                               deallocator: nil)
             else { return }
+            
+            // --- Effective sample‑rate measurement ---------------------------------
+            let thisHostTime = inInputTime.pointee.mHostTime
+            if self.lastHostTime != 0, thisHostTime > self.lastHostTime {
+                let effectiveSR = Double(buffer.frameLength) /
+                (Double(thisHostTime - self.lastHostTime) / Self.hostTicksPerSecond)
+                self.logger.info("🟢 Effective sample rate ≈ \(Int(effectiveSR)) Hz")
+            }
+            self.lastHostTime = thisHostTime
+            // -----------------------------------------------------------------------
             
             // -----------   Log New buffer format  -----------
             let sr  = buffer.format.sampleRate
