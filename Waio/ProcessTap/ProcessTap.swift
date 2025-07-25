@@ -227,12 +227,20 @@ final class ProcessTapRecorder {
     // ── Resampling configuration ────────────────────────────────────────────
     private let targetSampleRate: Double
     private let targetChannels: AVAudioChannelCount
-    private let driftThreshold: Double = 0.001         // 0.1 % SR tolerance
-    private let smoothingAlpha: Double  = 0.1          // EMA weight
+    
+    // ── Dynamic‑rate tracking ─────────────────────────────────────────
+    private let driftThreshold: Double = 0.001          // 0.1 % tolerance
+    private let smoothingAlpha: Double  = 0.1            // EMA weight
     @ObservationIgnored private var smoothedEffectiveSampleRate: Double = 0
+    @ObservationIgnored private var converterInputSampleRate: Double = 0
+    
+    // Hysteresis for large, asynchronous sample‑rate jumps (e.g. 48 k → 24 k when a VoIP call starts)
+    private let largeChangeRatio: Double = 0.05      // 5 % or more is considered a *new* rate, not drift
+    private let consecutiveConfirmationsNeeded = 8   // how many successive buffers must confirm the new rate
+    @ObservationIgnored private var pendingRate: Double?
+    @ObservationIgnored private var confirmationCount: Int = 0
     
     // Current converter state (writerQueue‑confined)
-    @ObservationIgnored private var converterInputSampleRate: Double = 0
     @ObservationIgnored private var sourceFormat: AVAudioFormat?
     @ObservationIgnored private var targetFormat: AVAudioFormat?
     @ObservationIgnored private var converter: AVAudioConverter?
@@ -337,16 +345,22 @@ final class ProcessTapRecorder {
                 (Double(thisHostTime - self.lastHostTime) / Self.hostTicksPerSecond)
                 self.logger.info("🟢 Effective sample rate ≈ \(Int(effectiveSR)) Hz")
                 
-                // Exponential moving average to stabilise SR
-                self.smoothedEffectiveSampleRate =
-                self.smoothedEffectiveSampleRate == 0
-                ? effectiveSR
-                : self.smoothedEffectiveSampleRate * (1 - self.smoothingAlpha) + effectiveSR * self.smoothingAlpha
+                // Exponential‑moving‑average smoothing
+                if self.smoothedEffectiveSampleRate == 0 {
+                    self.smoothedEffectiveSampleRate = effectiveSR
+                } else {
+                    self.smoothedEffectiveSampleRate =
+                    self.smoothedEffectiveSampleRate * (1 - self.smoothingAlpha) +
+                    effectiveSR * self.smoothingAlpha
+                }
                 self.lastHostTime = thisHostTime
             } else {
                 self.lastHostTime = thisHostTime
             }
             // -----------------------------------------------------------------------
+            
+            // Snapshot for the writer queue
+            let capturedEffSR = self.smoothedEffectiveSampleRate
             
             // Deep‑copy the no‑copy buffer so its memory is valid outside the RT callback
             guard
@@ -376,28 +390,48 @@ final class ProcessTapRecorder {
                 }
             }
             
-            // Snapshot the current smoothed SR so the writer queue sees a stable value
-            let capturedEffSR = self.smoothedEffectiveSampleRate
             // Offload disk I/O to the writer queue to keep the audio callback real‑time safe
             self.writerQueue.async { [weak self, ownedBuffer, capturedEffSR] in
                 guard let self,
                       let tgtFormat = self.targetFormat else { return }
                 
-                // ── Drift detection & converter rebuild ───────────────────
+                // ── Large‑jump detection with hysteresis ─────────────────────────
                 let effSR = capturedEffSR
-                if effSR > 0,
-                   abs(effSR - self.converterInputSampleRate) / self.converterInputSampleRate > self.driftThreshold,
-                   let newInFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                                sampleRate: effSR,
-                                                channels: ownedBuffer.format.channelCount,
-                                                interleaved: false) {
+                if effSR > 0 {
+                    let diffRatio = abs(effSR - self.converterInputSampleRate) / self.converterInputSampleRate
                     
-                    self.converter = AVAudioConverter(from: newInFmt, to: tgtFormat)
-                    if ownedBuffer.format.channelCount > tgtFormat.channelCount {
-                        self.converter?.downmix = true
+                    if diffRatio >= self.largeChangeRatio {
+                        // Possible new base‑rate – wait for a few consecutive confirmations
+                        if let pending = self.pendingRate,
+                           abs(pending - effSR) / pending < 0.005 {     // within 0.5 % of the same value
+                            self.confirmationCount += 1
+                        } else {
+                            self.pendingRate = effSR
+                            self.confirmationCount = 1
+                        }
+                        
+                        if self.confirmationCount >= self.consecutiveConfirmationsNeeded,
+                           let confirmedSR = self.pendingRate,
+                           let newInFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                                        sampleRate: confirmedSR,
+                                                        channels: ownedBuffer.format.channelCount,
+                                                        interleaved: ownedBuffer.format.isInterleaved) {
+                            
+                            self.converter = AVAudioConverter(from: newInFmt, to: tgtFormat)
+                            self.converter?.reset()
+                            if newInFmt.channelCount > tgtFormat.channelCount {
+                                self.converter?.downmix = true
+                            }
+                            self.converterInputSampleRate = confirmedSR
+                            self.pendingRate = nil
+                            self.confirmationCount = 0
+                            self.logger.info("🔄 Confirmed new input rate – rebuilding converter for \(Int(confirmedSR)) Hz")
+                        }
+                    } else {
+                        // Within normal drift – clear any pending change
+                        self.pendingRate = nil
+                        self.confirmationCount = 0
                     }
-                    self.converterInputSampleRate = effSR
-                    self.logger.info("🔄 Re‑created converter for \(Int(effSR)) Hz input")
                 }
                 
                 // Ensure buffer format matches converter.inputFormat; otherwise
@@ -419,13 +453,12 @@ final class ProcessTapRecorder {
                     inBuffer = compat
                 }
                 
-                // Size output buffer: Core Audio requires capacity ≥ input.frameLength
+                // Output‑capacity estimate: allow for SRC in either direction
                 let ratio = tgtFormat.sampleRate / converter.inputFormat.sampleRate
-                // Ensure capacity is large enough for both up‑ and down‑sampling paths
-                let estimated = Double(ownedBuffer.frameLength) * ratio
-                let neededFrames = AVAudioFrameCount(
-                    max(Double(ownedBuffer.frameLength), estimated).rounded(.up) + 32
-                )
+                let estimated = Double(ownedBuffer.frameLength) * ratio          // expected frame count after SRC
+                                                                                 // For up‑sampling we need at least inputLen; for down‑sampling we need only the estimate.
+                let capacity = (ratio >= 1.0 ? Double(ownedBuffer.frameLength) : estimated).rounded(.up) + 32
+                let neededFrames = AVAudioFrameCount(capacity)
                 guard let outBuffer = AVAudioPCMBuffer(pcmFormat: tgtFormat,
                                                        frameCapacity: neededFrames) else { return }
                 
@@ -442,6 +475,7 @@ final class ProcessTapRecorder {
                         }
                         if status == .error, let err = error { throw err }
                     }
+                    self.logger.debug("converted \(inBuffer.frameLength) → \(outBuffer.frameLength)")
                     try self.currentFile?.write(from: outBuffer)
                 } catch {
                     self.logger.error("Conversion/write error: \(error, privacy: .public)")
