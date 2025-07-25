@@ -330,18 +330,33 @@ final class ProcessTapRecorder {
         
         // MARK: Core Audio I/O Block
         try tap.run(on: queue) { [weak self] inNow, inInputData, inInputTime, outOutputData, inOutputTime in
-            guard
-                let self,
-                let currentFile = self.currentFile,
-                let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                              bufferListNoCopy: inInputData,
-                                              deallocator: nil)
+            // --- Read live format and create buffer ---
+            guard var desc = tap.tapStreamDescription else { return }
+            guard let inFmt = AVAudioFormat(streamDescription: &desc) else { return }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: inFmt,
+                                                bufferListNoCopy: inInputData,
+                                                deallocator: nil) else { return }
+            // Detect and rebuild converter if input format changed
+            if inFmt != self?.converter?.inputFormat {
+                self?.writerQueue.async { [weak self] in
+                    guard let self, let tgt = self.targetFormat else { return }
+                    self.converter = AVAudioConverter(from: inFmt, to: tgt)
+                    if inFmt.channelCount > tgt.channelCount {
+                        self.converter?.downmix = true
+                    }
+                    self.converterInputSampleRate = inFmt.sampleRate
+                    self.logger.info("🔄 Rebuilt converter for \(Int(inFmt.sampleRate)) Hz / \(inFmt.channelCount)ch")
+                }
+            }
+            guard let self,
+                  let currentFile = self.currentFile
             else { return }
             
             // --- Effective sample‑rate measurement ---------------------------------
+            var effectiveSR = self.converterInputSampleRate
             let thisHostTime = inInputTime.pointee.mHostTime
             if self.lastHostTime != 0, thisHostTime > self.lastHostTime {
-                let effectiveSR = Double(buffer.frameLength) /
+                effectiveSR = Double(buffer.frameLength) /
                 (Double(thisHostTime - self.lastHostTime) / Self.hostTicksPerSecond)
                 self.logger.info("🟢 Effective sample rate ≈ \(Int(effectiveSR)) Hz")
                 
@@ -359,29 +374,29 @@ final class ProcessTapRecorder {
             }
             // -----------------------------------------------------------------------
             
-            // Snapshot for the writer queue
-            let capturedEffSR = self.smoothedEffectiveSampleRate
+            // Pass the raw rate to the writer queue
+            let capturedEffSR = effectiveSR
             
             // Deep‑copy the no‑copy buffer so its memory is valid outside the RT callback
             guard
-                let ownedBuffer = AVAudioPCMBuffer(pcmFormat: format,
+                let ownedBuffer = AVAudioPCMBuffer(pcmFormat: buffer.format,
                                                    frameCapacity: buffer.frameCapacity)
             else { return }
             
             ownedBuffer.frameLength = buffer.frameLength
             // Explicit memcpy of sample data for compatibility with all SDKs
-            if format.isInterleaved {
+            if buffer.format.isInterleaved {
                 // Interleaved: all channels stored sequentially in one buffer
                 if let src = buffer.floatChannelData?[0],
                    let dst = ownedBuffer.floatChannelData?[0] {
                     let byteCount = Int(buffer.frameLength) *
-                    Int(format.channelCount) *
+                    Int(buffer.format.channelCount) *
                     MemoryLayout<Float>.size
                     memcpy(dst, src, byteCount)
                 }
             } else {
                 // Non‑interleaved (planar): copy channel‑by‑channel
-                for ch in 0 ..< Int(format.channelCount) {
+                for ch in 0 ..< Int(buffer.format.channelCount) {
                     if let src = buffer.floatChannelData?[ch],
                        let dst = ownedBuffer.floatChannelData?[ch] {
                         let byteCount = Int(buffer.frameLength) * MemoryLayout<Float>.size
@@ -395,43 +410,20 @@ final class ProcessTapRecorder {
                 guard let self,
                       let tgtFormat = self.targetFormat else { return }
                 
-                // ── Large‑jump detection with hysteresis ─────────────────────────
-                let effSR = capturedEffSR
-                if effSR > 0 {
-                    let diffRatio = abs(effSR - self.converterInputSampleRate) / self.converterInputSampleRate
+                // --- Detect an abrupt base-rate change and rebuild immediately ---
+                let diffRatio = abs(capturedEffSR - self.converterInputSampleRate) / self.converterInputSampleRate
+                if diffRatio >= self.largeChangeRatio,
+                   let newInFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                                sampleRate: capturedEffSR,
+                                                channels: ownedBuffer.format.channelCount,
+                                                interleaved: ownedBuffer.format.isInterleaved) {
                     
-                    if diffRatio >= self.largeChangeRatio {
-                        // Possible new base‑rate – wait for a few consecutive confirmations
-                        if let pending = self.pendingRate,
-                           abs(pending - effSR) / pending < 0.005 {     // within 0.5 % of the same value
-                            self.confirmationCount += 1
-                        } else {
-                            self.pendingRate = effSR
-                            self.confirmationCount = 1
-                        }
-                        
-                        if self.confirmationCount >= self.consecutiveConfirmationsNeeded,
-                           let confirmedSR = self.pendingRate,
-                           let newInFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                                        sampleRate: confirmedSR,
-                                                        channels: ownedBuffer.format.channelCount,
-                                                        interleaved: ownedBuffer.format.isInterleaved) {
-                            
-                            self.converter = AVAudioConverter(from: newInFmt, to: tgtFormat)
-                            self.converter?.reset()
-                            if newInFmt.channelCount > tgtFormat.channelCount {
-                                self.converter?.downmix = true
-                            }
-                            self.converterInputSampleRate = confirmedSR
-                            self.pendingRate = nil
-                            self.confirmationCount = 0
-                            self.logger.info("🔄 Confirmed new input rate – rebuilding converter for \(Int(confirmedSR)) Hz")
-                        }
-                    } else {
-                        // Within normal drift – clear any pending change
-                        self.pendingRate = nil
-                        self.confirmationCount = 0
+                    self.converter = AVAudioConverter(from: newInFmt, to: tgtFormat)
+                    if newInFmt.channelCount > tgtFormat.channelCount {
+                        self.converter?.downmix = true
                     }
+                    self.converterInputSampleRate = capturedEffSR
+                    self.logger.info("🚨 Detected new base rate – rebuilt converter for \(Int(capturedEffSR)) Hz")
                 }
                 
                 // Ensure buffer format matches converter.inputFormat; otherwise
@@ -515,4 +507,3 @@ final class ProcessTapRecorder {
         logger.debug(#function)
     }
 }
-    
