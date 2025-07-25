@@ -254,6 +254,16 @@ final class ProcessTapRecorder {
     @ObservationIgnored private var targetFormat: AVAudioFormat?
     @ObservationIgnored private var converter: AVAudioConverter?
     
+    // Helper that always builds a high‑quality converter
+    private func makeConverter(input: AVAudioFormat, output: AVAudioFormat) -> AVAudioConverter? {
+        guard let c = AVAudioConverter(from: input, to: output) else { return nil }
+        c.sampleRateConverterQuality   = .max      // 96‑tap sinc SRC
+        c.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Normal   // polyphase windowed‑sinc
+        c.primeMethod                  = .normal   // prime filter delay line
+        if input.channelCount > output.channelCount { c.downmix = true }
+        return c
+    }
+    
     // MARK: Private
     
     private let queue  = DispatchQueue(label: "ProcessTapRecorder", qos: .userInitiated)
@@ -270,7 +280,7 @@ final class ProcessTapRecorder {
     
     init(fileURL: URL,
          tap: ProcessTap,
-         targetSampleRate: Double = 24_000,
+         targetSampleRate: Double = 16_000,
          targetChannels: AVAudioChannelCount = 1) {
         self.process  = tap.process
         self.fileURL  = fileURL
@@ -327,8 +337,7 @@ final class ProcessTapRecorder {
         }
         self.targetFormat = tgtFormat
         
-        self.converter = AVAudioConverter(from: format, to: tgtFormat)
-        if format.channelCount > targetChannels { self.converter?.downmix = true }
+        self.converter = makeConverter(input: format, output: tgtFormat)
         self.converterInputSampleRate = format.sampleRate
         
         let file = try AVAudioFile(forWriting: fileURL,
@@ -349,10 +358,7 @@ final class ProcessTapRecorder {
             if inFmt != self?.converter?.inputFormat {
                 self?.writerQueue.async { [weak self] in
                     guard let self, let tgt = self.targetFormat else { return }
-                    self.converter = AVAudioConverter(from: inFmt, to: tgt)
-                    if inFmt.channelCount > tgt.channelCount {
-                        self.converter?.downmix = true
-                    }
+                    self.converter = self.makeConverter(input: inFmt, output: tgt)
                     self.converterInputSampleRate = inFmt.sampleRate
                     self.logger.info("🔄 Rebuilt converter for \(Int(inFmt.sampleRate)) Hz / \(inFmt.channelCount)ch")
                 }
@@ -427,13 +433,7 @@ final class ProcessTapRecorder {
                                                 sampleRate: nominalSR,
                                                 channels: ownedBuffer.format.channelCount,
                                                 interleaved: ownedBuffer.format.isInterleaved) {
-                    
-                    self.converter = AVAudioConverter(from: newInFmt, to: tgtFormat)
-                    if newInFmt.channelCount > tgtFormat.channelCount {
-                        self.converter?.downmix = true
-                    }
-                    // Use highest quality polyphase filter
-                    self.converter?.sampleRateConverterQuality = .max
+                    self.converter = self.makeConverter(input: newInFmt, output: tgtFormat)
                     self.converterInputSampleRate = nominalSR
                     self.logger.info("🚨 Detected new base rate – rebuilt converter for \(Int(nominalSR)) Hz (quality: max)")
                 }
