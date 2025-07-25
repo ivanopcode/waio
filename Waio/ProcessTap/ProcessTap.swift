@@ -469,9 +469,16 @@ final class ProcessTapRecorder {
                     } else {
                         // Use the streaming API for SRC
                         var error: NSError?
+                        var handedOff = false
                         let status = converter.convert(to: outBuffer, error: &error) { _, outStatus -> AVAudioBuffer? in
-                            outStatus.pointee = .haveData
-                            return inBuffer
+                            if !handedOff {
+                                handedOff = true
+                                outStatus.pointee = .haveData
+                                return inBuffer
+                            } else {
+                                outStatus.pointee = .noDataNow
+                                return nil
+                            }
                         }
                         if status == .error, let err = error { throw err }
                     }
@@ -508,3 +515,4 @@ final class ProcessTapRecorder {
         logger.debug(#function)
     }
 }
+    
