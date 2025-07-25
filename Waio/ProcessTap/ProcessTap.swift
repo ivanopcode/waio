@@ -236,6 +236,15 @@ final class ProcessTapRecorder {
     
     // Hysteresis for large, asynchronous sample‑rate jumps (e.g. 48 k → 24 k when a VoIP call starts)
     private let largeChangeRatio: Double = 0.05      // 5 % or more is considered a *new* rate, not drift
+                                                     /// Common telephony / media sample‑rates we will snap to (Hz)
+    private static let nominalRates: [Double] = [
+        8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000
+    ]
+    
+    /// Pick the nearest nominal rate for a measured value
+    private static func nearestNominal(_ measured: Double) -> Double {
+        nominalRates.min(by: { abs($0 - measured) < abs($1 - measured) }) ?? measured
+    }
     private let consecutiveConfirmationsNeeded = 8   // how many successive buffers must confirm the new rate
     @ObservationIgnored private var pendingRate: Double?
     @ObservationIgnored private var confirmationCount: Int = 0
@@ -261,7 +270,7 @@ final class ProcessTapRecorder {
     
     init(fileURL: URL,
          tap: ProcessTap,
-         targetSampleRate: Double = 16_000,
+         targetSampleRate: Double = 24_000,
          targetChannels: AVAudioChannelCount = 1) {
         self.process  = tap.process
         self.fileURL  = fileURL
@@ -410,11 +419,12 @@ final class ProcessTapRecorder {
                 guard let self,
                       let tgtFormat = self.targetFormat else { return }
                 
-                // --- Detect an abrupt base-rate change and rebuild immediately ---
-                let diffRatio = abs(capturedEffSR - self.converterInputSampleRate) / self.converterInputSampleRate
+                // --- Snap to nearest nominal rate and rebuild converter for stable SRC ---
+                let nominalSR = Self.nearestNominal(capturedEffSR)
+                let diffRatio = abs(nominalSR - self.converterInputSampleRate) / self.converterInputSampleRate
                 if diffRatio >= self.largeChangeRatio,
                    let newInFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                                sampleRate: capturedEffSR,
+                                                sampleRate: nominalSR,
                                                 channels: ownedBuffer.format.channelCount,
                                                 interleaved: ownedBuffer.format.isInterleaved) {
                     
@@ -422,8 +432,10 @@ final class ProcessTapRecorder {
                     if newInFmt.channelCount > tgtFormat.channelCount {
                         self.converter?.downmix = true
                     }
-                    self.converterInputSampleRate = capturedEffSR
-                    self.logger.info("🚨 Detected new base rate – rebuilt converter for \(Int(capturedEffSR)) Hz")
+                    // Use highest quality polyphase filter
+                    self.converter?.sampleRateConverterQuality = .max
+                    self.converterInputSampleRate = nominalSR
+                    self.logger.info("🚨 Detected new base rate – rebuilt converter for \(Int(nominalSR)) Hz (quality: max)")
                 }
                 
                 // Ensure buffer format matches converter.inputFormat; otherwise
@@ -448,8 +460,8 @@ final class ProcessTapRecorder {
                 // Output‑capacity estimate: allow for SRC in either direction
                 let ratio = tgtFormat.sampleRate / converter.inputFormat.sampleRate
                 let estimated = Double(ownedBuffer.frameLength) * ratio          // expected frame count after SRC
-                                                                                 // For up‑sampling we need at least inputLen; for down‑sampling we need only the estimate.
-                let capacity = (ratio >= 1.0 ? Double(ownedBuffer.frameLength) : estimated).rounded(.up) + 32
+                                                                                 // Always allocate at least input length + 32 frames to avoid truncation
+                let capacity = max(Double(ownedBuffer.frameLength), estimated).rounded(.up) + 32
                 let neededFrames = AVAudioFrameCount(capacity)
                 guard let outBuffer = AVAudioPCMBuffer(pcmFormat: tgtFormat,
                                                        frameCapacity: neededFrames) else { return }
