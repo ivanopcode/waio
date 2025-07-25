@@ -379,14 +379,16 @@ private extension AudioProcess {
     init(objectID: AudioObjectID, pid: pid_t) throws {
         
         let bundleID  = objectID.readProcessBundleID()
-        let bundleURL = processInfo(for: pid)?.path
-            .compactMap { URL(fileURLWithPath: String($0)).topmostAppBundleURL() }
+        let bundleURL = processInfo(for: pid)
+            .flatMap { info in
+                URL(fileURLWithPath: info.path).topmostAppBundleURL()
+            }
         let name      = processInfo(for: pid)?.name
         ?? bundleID?.lastReverseDNSComponent
         ?? "Unknown (\(pid))"
         
         let parentURL = Self.inferParentBundleURL(bundleID: bundleID,
-                                                  bundleURL: bundleURL?.first)
+                                                  bundleURL: bundleURL)
         
         Self.logInit(kind: "bare-pid",
                      pid: pid,
@@ -398,10 +400,10 @@ private extension AudioProcess {
         self.init(corePID         : pid,
                   name            : name,
                   bundleID        : bundleID?.isEmpty == true ? nil : bundleID,
-                  bundleURL       : bundleURL?.first,
+                  bundleURL       : bundleURL,
                   parentBundleURL : parentURL,
                   objectID        : objectID,
-                  kind            : bundleURL?.first?.isApp == true ? .app : .process)
+                  kind            : bundleURL?.isApp == true ? .app : .process)
     }
 }
 
