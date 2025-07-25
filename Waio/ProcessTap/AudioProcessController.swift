@@ -20,9 +20,13 @@ struct AudioProcess: Identifiable, Hashable, Sendable {
         }
     }
     enum SupportedProcess: String, Sendable, Hashable {
-        case telegram = "Telegram"
-        case braveBrowserBeta = "Brave Browser Beta Helper"
-        case whatsApp = "WhatsApp"
+        case telegram = "ru.keepcoder.Telegram"
+        case braveBrowserBeta = "com.brave.Browser.beta.helper"
+        case chrome = "com.google.Chrome.helper"
+        case chromium = "org.chromium.Chromium.helper"
+        case whatsApp = "net.whatsapp.WhatsApp"
+        case webkit = "com.apple.WebKit.GPU"
+        case discord = "com.hnc.Discord.helper"
     }
     
     var id: pid_t
@@ -55,7 +59,8 @@ extension AudioProcess.Kind {
 extension AudioProcess.SupportedProcess {
     var defaultIcon: NSImage {
         switch self {
-            case .braveBrowserBeta, .telegram, .whatsApp:
+           // case .braveBrowserBeta, .telegram, .whatsApp, .webkit, .chromium:
+            default:
                 NSWorkspace.shared.icon(for: .applicationBundle)
         }
     }
@@ -321,7 +326,7 @@ private extension AudioProcess {
             id: pid,
             kind: kind,
             name: name,
-            knownType: SupportedProcess(rawValue: name),
+            knownType: bundleID.flatMap { SupportedProcess(rawValue: $0) },
             audioActive: objectID.readProcessIsRunning(),
             bundleID: bundleID,
             bundleURL: bundleURL,
