@@ -224,6 +224,19 @@ final class ProcessTapRecorder {
     let fileURL: URL
     let process: AudioProcess
     
+    // ── Resampling configuration ────────────────────────────────────────────
+    private let targetSampleRate: Double
+    private let targetChannels: AVAudioChannelCount
+    private let driftThreshold: Double = 0.001         // 0.1 % SR tolerance
+    private let smoothingAlpha: Double  = 0.1          // EMA weight
+    @ObservationIgnored private var smoothedEffectiveSampleRate: Double = 0
+    
+    // Current converter state (writerQueue‑confined)
+    @ObservationIgnored private var converterInputSampleRate: Double = 0
+    @ObservationIgnored private var sourceFormat: AVAudioFormat?
+    @ObservationIgnored private var targetFormat: AVAudioFormat?
+    @ObservationIgnored private var converter: AVAudioConverter?
+    
     // MARK: Private
     
     private let queue  = DispatchQueue(label: "ProcessTapRecorder", qos: .userInitiated)
@@ -238,10 +251,15 @@ final class ProcessTapRecorder {
     
     // MARK: Init
     
-    init(fileURL: URL, tap: ProcessTap) {
+    init(fileURL: URL,
+         tap: ProcessTap,
+         targetSampleRate: Double = 16_000,
+         targetChannels: AVAudioChannelCount = 1) {
         self.process  = tap.process
         self.fileURL  = fileURL
         self._tap     = tap
+        self.targetSampleRate = targetSampleRate
+        self.targetChannels   = targetChannels
         self.logger   = Logger(subsystem: kAppSubsystem,
                                category: "\(String(describing: ProcessTapRecorder.self))(\(fileURL.lastPathComponent))")
     }
@@ -282,17 +300,24 @@ final class ProcessTapRecorder {
             interleaved: \(format.isInterleaved, privacy: .public)
             """)
         
-        // Prepare file for writing
-        let settings: [String: Any] = [
-            AVFormatIDKey:        streamDescription.mFormatID,
-            AVSampleRateKey:      format.sampleRate,
-            AVNumberOfChannelsKey: format.channelCount
-        ]
-        let file = try AVAudioFile(forWriting: fileURL,
-                                   settings: settings,
-                                   commonFormat: .pcmFormatFloat32,
-                                   interleaved: format.isInterleaved)
+        self.sourceFormat = format
         
+        guard let tgtFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                            sampleRate: targetSampleRate,
+                                            channels: targetChannels,
+                                            interleaved: false) else {
+            throw "Failed to create target AVAudioFormat."
+        }
+        self.targetFormat = tgtFormat
+        
+        self.converter = AVAudioConverter(from: format, to: tgtFormat)
+        if format.channelCount > targetChannels { self.converter?.downmix = true }
+        self.converterInputSampleRate = format.sampleRate
+        
+        let file = try AVAudioFile(forWriting: fileURL,
+                                   settings: tgtFormat.settings,
+                                   commonFormat: .pcmFormatFloat32,
+                                   interleaved: false)
         self.currentFile = file
         
         // MARK: Core Audio I/O Block
@@ -311,8 +336,16 @@ final class ProcessTapRecorder {
                 let effectiveSR = Double(buffer.frameLength) /
                 (Double(thisHostTime - self.lastHostTime) / Self.hostTicksPerSecond)
                 self.logger.info("🟢 Effective sample rate ≈ \(Int(effectiveSR)) Hz")
+                
+                // Exponential moving average to stabilise SR
+                self.smoothedEffectiveSampleRate =
+                self.smoothedEffectiveSampleRate == 0
+                ? effectiveSR
+                : self.smoothedEffectiveSampleRate * (1 - self.smoothingAlpha) + effectiveSR * self.smoothingAlpha
+                self.lastHostTime = thisHostTime
+            } else {
+                self.lastHostTime = thisHostTime
             }
-            self.lastHostTime = thisHostTime
             // -----------------------------------------------------------------------
             
             // Deep‑copy the no‑copy buffer so its memory is valid outside the RT callback
@@ -343,12 +376,75 @@ final class ProcessTapRecorder {
                 }
             }
             
+            // Snapshot the current smoothed SR so the writer queue sees a stable value
+            let capturedEffSR = self.smoothedEffectiveSampleRate
             // Offload disk I/O to the writer queue to keep the audio callback real‑time safe
-            self.writerQueue.async { [logger = self.logger] in
+            self.writerQueue.async { [weak self, ownedBuffer, capturedEffSR] in
+                guard let self,
+                      let tgtFormat = self.targetFormat else { return }
+                
+                // ── Drift detection & converter rebuild ───────────────────
+                let effSR = capturedEffSR
+                if effSR > 0,
+                   abs(effSR - self.converterInputSampleRate) / self.converterInputSampleRate > self.driftThreshold,
+                   let newInFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                                sampleRate: effSR,
+                                                channels: ownedBuffer.format.channelCount,
+                                                interleaved: false) {
+                    
+                    self.converter = AVAudioConverter(from: newInFmt, to: tgtFormat)
+                    if ownedBuffer.format.channelCount > tgtFormat.channelCount {
+                        self.converter?.downmix = true
+                    }
+                    self.converterInputSampleRate = effSR
+                    self.logger.info("🔄 Re‑created converter for \(Int(effSR)) Hz input")
+                }
+                
+                // Ensure buffer format matches converter.inputFormat; otherwise
+                // reinterpret samples in a new buffer with the correct ASBD.
+                var inBuffer = ownedBuffer
+                guard let converter = self.converter else { return }
+                if ownedBuffer.format != converter.inputFormat,
+                   let compat = AVAudioPCMBuffer(pcmFormat: converter.inputFormat,
+                                                 frameCapacity: ownedBuffer.frameLength) {
+                    compat.frameLength = ownedBuffer.frameLength
+                    // Sample‑for‑sample copy (format is always float32 here)
+                    let channels = Int(converter.inputFormat.channelCount)
+                    for ch in 0..<channels {
+                        if let src = ownedBuffer.floatChannelData?[ch],
+                           let dst = compat.floatChannelData?[ch] {
+                            memcpy(dst, src, Int(ownedBuffer.frameLength) * MemoryLayout<Float>.size)
+                        }
+                    }
+                    inBuffer = compat
+                }
+                
+                // Size output buffer: Core Audio requires capacity ≥ input.frameLength
+                let ratio = tgtFormat.sampleRate / converter.inputFormat.sampleRate
+                // Ensure capacity is large enough for both up‑ and down‑sampling paths
+                let estimated = Double(ownedBuffer.frameLength) * ratio
+                let neededFrames = AVAudioFrameCount(
+                    max(Double(ownedBuffer.frameLength), estimated).rounded(.up) + 32
+                )
+                guard let outBuffer = AVAudioPCMBuffer(pcmFormat: tgtFormat,
+                                                       frameCapacity: neededFrames) else { return }
+                
                 do {
-                    try currentFile.write(from: ownedBuffer)
+                    if converter.inputFormat.sampleRate == converter.outputFormat.sampleRate {
+                        // No sample‑rate conversion needed
+                        try converter.convert(to: outBuffer, from: inBuffer)
+                    } else {
+                        // Use the streaming API for SRC
+                        var error: NSError?
+                        let status = converter.convert(to: outBuffer, error: &error) { _, outStatus -> AVAudioBuffer? in
+                            outStatus.pointee = .haveData
+                            return inBuffer
+                        }
+                        if status == .error, let err = error { throw err }
+                    }
+                    try self.currentFile?.write(from: outBuffer)
                 } catch {
-                    logger.error("File write error: \(error, privacy: .public)")
+                    self.logger.error("Conversion/write error: \(error, privacy: .public)")
                 }
             }
         } invalidationHandler: { [weak self] _ in
