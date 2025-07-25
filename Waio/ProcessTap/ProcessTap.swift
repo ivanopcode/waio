@@ -391,7 +391,7 @@ final class ProcessTapRecorder {
             }
             
             // Offload disk I/O to the writer queue to keep the audio callback real‑time safe
-            self.writerQueue.async { [weak self, ownedBuffer, capturedEffSR] in
+            self.writerQueue.async(execute: { [weak self, ownedBuffer, capturedEffSR] in
                 guard let self,
                       let tgtFormat = self.targetFormat else { return }
                 
@@ -480,7 +480,7 @@ final class ProcessTapRecorder {
                 } catch {
                     self.logger.error("Conversion/write error: \(error, privacy: .public)")
                 }
-            }
+            })
         } invalidationHandler: { [weak self] _ in
             self?.handleInvalidation()
         }
