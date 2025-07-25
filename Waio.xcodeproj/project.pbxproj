@@ -6,6 +6,11 @@
 	objectVersion = 71;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AA489FB92E33E23000AB7BC5 /* Collections in Frameworks */ = {isa = PBXBuildFile; productRef = AA489FB82E33E23000AB7BC5 /* Collections */; };
+		AA489FBB2E33E23000AB7BC5 /* OrderedCollections in Frameworks */ = {isa = PBXBuildFile; productRef = AA489FBA2E33E23000AB7BC5 /* OrderedCollections */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		F47AD93E2BF5B61E005B75AC /* Waio.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Waio.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -19,6 +24,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA489FBB2E33E23000AB7BC5 /* OrderedCollections in Frameworks */,
+				AA489FB92E33E23000AB7BC5 /* Collections in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -88,6 +95,9 @@
 				Base,
 			);
 			mainGroup = F47AD9352BF5B61E005B75AC;
+			packageReferences = (
+				AA489FB72E33E23000AB7BC5 /* XCRemoteSwiftPackageReference "swift-collections" */,
+			);
 			productRefGroup = F47AD93F2BF5B61E005B75AC /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -328,6 +338,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		AA489FB72E33E23000AB7BC5 /* XCRemoteSwiftPackageReference "swift-collections" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-collections.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.2.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AA489FB82E33E23000AB7BC5 /* Collections */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA489FB72E33E23000AB7BC5 /* XCRemoteSwiftPackageReference "swift-collections" */;
+			productName = Collections;
+		};
+		AA489FBA2E33E23000AB7BC5 /* OrderedCollections */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA489FB72E33E23000AB7BC5 /* XCRemoteSwiftPackageReference "swift-collections" */;
+			productName = OrderedCollections;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = F47AD9362BF5B61E005B75AC /* Project object */;
 }

@@ -38,7 +38,7 @@ struct RootView: View {
 
     @ViewBuilder
     private var recordingView: some View {
-        ProcessSelectionView()
+        ProcessSelectionView(displayedGroups: [.app, .process], onlyKnownKinds: false)
     }
 }
 

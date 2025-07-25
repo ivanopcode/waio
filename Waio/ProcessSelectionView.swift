@@ -1,20 +1,34 @@
 import SwiftUI
+import OSLog
 
 @MainActor
 struct ProcessSelectionView: View {
-    @State private var processController = AudioProcessController()
+    @StateObject private var processController: AudioProcessController
     @State private var tap: ProcessTap?
     @State private var recorder: ProcessTapRecorder?
-
+    
     @State private var selectedProcess: AudioProcess?
-
+    
+    private let logger = Logger(subsystem: kAppSubsystem, category: "ProcessSelectionView")
+    
+    
+    init(displayedGroups: Set<AudioProcess.Kind>, onlyKnownKinds: Bool) {
+        self._processController = StateObject(
+            wrappedValue: AudioProcessController(
+                displayedGroups: displayedGroups,
+                onlyKnownKinds: onlyKnownKinds
+            )
+        )
+    }
+    
+    
     var body: some View {
         Section {
             Picker("Process", selection: $selectedProcess) {
                 Text("Select…")
                     .tag(Optional<AudioProcess>.none)
-
-                ForEach(processController.processGroups) { group in
+                
+                ForEach(processController.processGroups.values) { group in
                     Section {
                         ForEach(group.processes) { process in
                             HStack {
@@ -22,10 +36,10 @@ struct ProcessSelectionView: View {
                                     .resizable()
                                     .aspectRatio(contentMode: .fit)
                                     .frame(width: 16, height: 16)
-
+                                
                                 Text(process.name)
                             }
-                                .tag(Optional<AudioProcess>.some(process))
+                            .tag(Optional<AudioProcess>.some(process))
                         }
                     } header: {
                         Text(group.title)
@@ -36,8 +50,14 @@ struct ProcessSelectionView: View {
             .task { processController.activate() }
             .onChange(of: selectedProcess) { oldValue, newValue in
                 guard newValue != oldValue else { return }
-
+                
                 if let newValue {
+                    logger.info("""
+                        Selected process – name: \(newValue.name, privacy: .public), \
+                        pid: \(newValue.id, format: .decimal, privacy: .public), \
+                        bundleID: \(newValue.bundleID ?? "nil", privacy: .public)
+                        """)
+                    
                     setupRecording(for: newValue)
                 } else if oldValue == tap?.process {
                     teardownTap()
@@ -47,7 +67,7 @@ struct ProcessSelectionView: View {
             Text("Source")
                 .font(.headline)
         }
-
+        
         if let tap {
             if let errorMessage = tap.errorMessage {
                 Text(errorMessage)
@@ -64,25 +84,25 @@ struct ProcessSelectionView: View {
             }
         }
     }
-
+    
     private func setupRecording(for process: AudioProcess) {
         let newTap = ProcessTap(process: process)
         self.tap = newTap
         newTap.activate()
-
+        
         createRecorder()
     }
-
+    
     private func createRecorder() {
         guard let tap else { return }
-
+        
         let filename = "\(tap.process.name)-\(Int(Date.now.timeIntervalSinceReferenceDate))"
         let audioFileURL = URL.applicationSupport.appendingPathComponent(filename, conformingTo: .wav)
-
+        
         let newRecorder = ProcessTapRecorder(fileURL: audioFileURL, tap: tap)
         self.recorder = newRecorder
     }
-
+    
     private func teardownTap() {
         tap = nil
     }
@@ -99,7 +119,7 @@ extension URL {
             return subdir
         } catch {
             assertionFailure("Failed to get application support directory: \(error)")
-
+            
             return FileManager.default.temporaryDirectory
         }
     }

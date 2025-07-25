@@ -2,18 +2,36 @@ import SwiftUI
 import AudioToolbox
 import OSLog
 import Combine
+import OrderedCollections
 
 struct AudioProcess: Identifiable, Hashable, Sendable {
     enum Kind: String, Sendable {
         case process
         case app
+        
+        var sortPriority: Int {
+            switch self {
+                case .process:
+                    0
+                case .app:
+                    1
+            }
+        }
     }
+    enum SupportedProcess: String, Sendable, Hashable {
+        case telegram = "Telegram"
+        case braveBrowserBeta = "Brave Browser Beta Helper"
+        case whatsApp = "WhatsApp"
+    }
+    
     var id: pid_t
     var kind: Kind
     var name: String
+    let knownType: SupportedProcess?
     var audioActive: Bool
     var bundleID: String?
     var bundleURL: URL?
+    var parentAppBundleURL: URL?
     var objectID: AudioObjectID
 }
 
@@ -26,14 +44,29 @@ struct AudioProcessGroup: Identifiable, Hashable, Sendable {
 extension AudioProcess.Kind {
     var defaultIcon: NSImage {
         switch self {
-        case .process: NSWorkspace.shared.icon(for: .unixExecutable)
-        case .app: NSWorkspace.shared.icon(for: .applicationBundle)
+            case .process: NSWorkspace.shared.icon(for: .unixExecutable)
+            case .app: NSWorkspace.shared.icon(for: .applicationBundle)
+        }
+    }
+}
+
+
+extension AudioProcess.SupportedProcess {
+    var defaultIcon: NSImage {
+        switch self {
+            case .braveBrowserBeta, .telegram, .whatsApp:
+                NSWorkspace.shared.icon(for: .applicationBundle)
         }
     }
 }
 
 extension AudioProcess {
     var icon: NSImage {
+        if let parentAppBundleURL {
+            let image = NSWorkspace.shared.icon(forFile: parentAppBundleURL.path)
+            image.size = NSSize(width: 32, height: 32)
+            return image
+        }
         guard let bundleURL else { return kind.defaultIcon }
         let image = NSWorkspace.shared.icon(forFile: bundleURL.path)
         image.size = NSSize(width: 32, height: 32)
@@ -46,26 +79,37 @@ extension String: @retroactive LocalizedError {
 }
 
 @MainActor
-@Observable
-final class AudioProcessController {
-
+final class AudioProcessController: ObservableObject {
+    
+    private let displayedGroups: Set<AudioProcess.Kind>
+    private let onlyKnownKinds: Bool
+    
     private let logger = Logger(subsystem: kAppSubsystem, category: String(describing: AudioProcessController.self))
-
+    
     private(set) var processes = [AudioProcess]() {
         didSet {
             guard processes != oldValue else { return }
-
-            processGroups = AudioProcessGroup.groups(with: processes)
+            
+            processGroups = AudioProcessGroup.groups(
+                with: processes,
+                onlyKnownKinds: onlyKnownKinds,
+                displayedGroups: displayedGroups
+            )
         }
     }
-
-    private(set) var processGroups = [AudioProcessGroup]()
-
+    
+    @Published private(set) var processGroups = OrderedDictionary<AudioProcess.Kind, AudioProcessGroup>()
+    
     private var cancellables = Set<AnyCancellable>()
-
+    
+    init(displayedGroups: Set<AudioProcess.Kind>, onlyKnownKinds: Bool) {
+        self.displayedGroups = displayedGroups
+        self.onlyKnownKinds = onlyKnownKinds
+    }
+    
     func activate() {
         logger.debug(#function)
-
+        
         NSWorkspace.shared
             .publisher(for: \.runningApplications, options: [.initial, .new])
             .map { $0.filter({ $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) }
@@ -75,30 +119,30 @@ final class AudioProcessController {
             }
             .store(in: &cancellables)
     }
-
+    
     fileprivate func reload(apps: [NSRunningApplication]) {
         logger.debug(#function)
-
+        
         do {
             let objectIdentifiers = try AudioObjectID.readProcessList()
             
             let updatedProcesses: [AudioProcess] = objectIdentifiers.compactMap { objectID in
                 do {
                     let proc = try AudioProcess(objectID: objectID, runningApplications: apps)
-
-                    #if DEBUG
+                    
+#if DEBUG
                     if UserDefaults.standard.bool(forKey: "ACDumpProcessInfo") {
                         //. logger.debug("[PROCESS] \(String(describing: proc))")
                     }
-                    #endif
-
+#endif
+                    
                     return proc
                 } catch {
                     logger.warning("Failed to initialize process with object ID #\(objectID, privacy: .public): \(error, privacy: .public)")
                     return nil
                 }
             }
-
+            
             self.processes = updatedProcesses
                 .sorted { // Keep processes with audio active always on top
                     if $0.name.localizedStandardCompare($1.name) == .orderedAscending {
@@ -111,72 +155,235 @@ final class AudioProcessController {
             logger.error("Error reading process list: \(error, privacy: .public)")
         }
     }
-
+    
 }
 
 private extension AudioProcess {
-    init(app: NSRunningApplication, objectID: AudioObjectID) {
-        let name = app.localizedName ?? app.bundleURL?.deletingPathExtension().lastPathComponent ?? app.bundleIdentifier?.components(separatedBy: ".").last ?? "Unknown \(app.processIdentifier)"
-
+    
+    // ───────────────────────────── Helpers ─────────────────────────────
+    
+    /// Fixed list of suffixes that indicate a helper / plugin process.
+    static let defaultParentSuffixes: [String] =
+    [".helper.plugin", ".plugin", ".helper.Plugin", ".helper"]
+    
+    /// Pad or truncate to exactly `width` characters so columns line up.
+    static func fixed(_ str: String?, width: Int) -> String {
+        // Sanitise: drop any zero‑width bidi marks or other control characters
+        let cleaned = (str ?? "nil")
+            .unicodeScalars
+            .filter { !($0.properties.isBidiControl || CharacterSet.controlCharacters.contains($0)) }
+            .map(String.init)
+            .joined()
+        
+        return cleaned.count < width
+        ? cleaned.padding(toLength: width, withPad: " ", startingAt: 0)
+        : String(cleaned.prefix(width))
+    }
+    
+    /// Best‑effort human‑readable name for a running application.
+    static func humanName(for app: NSRunningApplication) -> String {
+        app.localizedName
+        ?? app.bundleURL?.deletingPathExtension().lastPathComponent
+        ?? app.bundleIdentifier?.components(separatedBy: ".").last
+        ?? "Unknown \(app.processIdentifier)"
+    }
+    
+    /// Guess the parent application’s bundle URL.
+    ///
+    /// 1. If `bundleID` ends with any `suffix`, look for a running application
+    ///    whose bundle identifier is the trimmed parent‑id.
+    /// 2. If that fails *or* `bundleID` is absent, climb the `bundleURL`
+    ///    hierarchy until we hit an `.app` bundle.
+    static func inferParentBundleURL(
+        bundleID : String?,
+        bundleURL: URL?,
+        suffixes : [String] = defaultParentSuffixes
+    ) -> URL? {
+        
+        // ── Strategy 1: running‑apps lookup via stripped bundle‑id ──
+        if
+            let bundleID,
+            let suffix = suffixes.first(where: { bundleID.hasSuffix($0) })
+        {
+            let parentID = String(bundleID.dropLast(suffix.count))
+            if let parent = NSRunningApplication
+                .runningApplications(withBundleIdentifier: parentID)
+                .first
+            {
+                return parent.bundleURL
+            }
+        }
+        
+        // ── Strategy 2: walk the helper's path up until we find ".app" ──
+        if let url = bundleURL?.topmostAppBundleURL() {
+            return url
+        }
+        
+        return nil
+    }
+    
+    // ───────────────────── Structured logging helpers ───────────────────
+    
+    private static let initLogger = Logger(subsystem: kAppSubsystem,
+                                           category: "AudioProcess.Init")
+    
+    static func logInit(kind: String,
+                        pid: pid_t,
+                        name: String,
+                        bundleID: String?,
+                        parent: URL?) {
+        initLogger.debug(
+          """
+          \(fixed(kind,width:12)) | pid \(pid,format:.decimal,align:.right(columns:6),privacy:.public) \
+          | name \(fixed(name,width:28)) \
+          | bundleID \(fixed(bundleID,width:38)) \
+          | parent \(fixed(parent?.lastPathComponent,width:18))
+          """
+        )
+    }
+    
+    // ────────────────── Designated core initializer ────────────────────
+    
+    /// All convenience inits forward to this to remove duplication.
+    init(corePID          pid: pid_t,
+         name             : String,
+         bundleID         : String?,
+         bundleURL        : URL?,
+         parentBundleURL  : URL?,
+         objectID         : AudioObjectID,
+         kind             : Kind) {
+        
         self.init(
-            id: app.processIdentifier,
-            kind: .app,
+            id: pid,
+            kind: kind,
             name: name,
+            knownType: SupportedProcess(rawValue: name),
             audioActive: objectID.readProcessIsRunning(),
-            bundleID: app.bundleIdentifier,
-            bundleURL: app.bundleURL,
+            bundleID: bundleID,
+            bundleURL: bundleURL,
+            parentAppBundleURL: parentBundleURL,
             objectID: objectID
         )
     }
-
+    
+    // ────────────────────── Convenience initializers ───────────────────
+    
+    /// Init from a running **helper / plugin** application.
+    init(app                : NSRunningApplication,
+         objectID           : AudioObjectID,
+         parentBundleSuffixes: [String] = Self.defaultParentSuffixes) {
+        
+        let name       = Self.humanName(for: app)
+        let parentURL  = Self.inferParentBundleURL(bundleID: app.bundleIdentifier,
+                                                   bundleURL: app.bundleURL,
+                                                   suffixes: parentBundleSuffixes)
+        
+        Self.logInit(kind: "helper‑app",
+                     pid: app.processIdentifier,
+                     name: name,
+                     bundleID: app.bundleIdentifier,
+                     parent: parentURL)
+        
+        self.init(corePID         : app.processIdentifier,
+                  name            : name,
+                  bundleID        : app.bundleIdentifier,
+                  bundleURL       : app.bundleURL,
+                  parentBundleURL : parentURL,
+                  objectID        : objectID,
+                  kind            : .app)
+    }
+    
+    /// Init from a Core Audio **process objectID** looking up in running apps list.
     init(objectID: AudioObjectID, runningApplications apps: [NSRunningApplication]) throws {
         let pid: pid_t = try objectID.read(kAudioProcessPropertyPID, defaultValue: -1)
-
+        Self.logInit(kind: "objectID→apps",
+                     pid: pid,
+                     name: "",          // not applicable
+                     bundleID: nil,
+                     parent: nil)
+        
         if let app = apps.first(where: { $0.processIdentifier == pid }) {
             self.init(app: app, objectID: objectID)
         } else {
             try self.init(objectID: objectID, pid: pid)
         }
     }
-
+    
+    /// Init when all we have is an objectID and a PID (often background daemons).
     init(objectID: AudioObjectID, pid: pid_t) throws {
-        let bundleID = objectID.readProcessBundleID()
-        let bundleURL: URL?
-        let name: String
-
-        (name, bundleURL) = if let info = processInfo(for: pid) {
-            (info.name, URL(fileURLWithPath: info.path).parentBundleURL())
-        } else if let id = bundleID?.lastReverseDNSComponent {
-            (id, nil)
-        } else {
-            ("Unknown (\(pid))", nil)
-        }
-
-        self.init(
-            id: pid,
-            kind: bundleURL?.isApp == true ? .app : .process,
-            name: name,
-            audioActive: objectID.readProcessIsRunning(),
-            bundleID: bundleID.flatMap { $0.isEmpty ? nil : $0 },
-            bundleURL: bundleURL,
-            objectID: objectID
-        )
+        
+        let bundleID  = objectID.readProcessBundleID()
+        let bundleURL = processInfo(for: pid)?.path
+            .compactMap { URL(fileURLWithPath: String($0)).topmostAppBundleURL() }
+        let name      = processInfo(for: pid)?.name
+        ?? bundleID?.lastReverseDNSComponent
+        ?? "Unknown (\(pid))"
+        
+        let parentURL = Self.inferParentBundleURL(bundleID: bundleID,
+                                                  bundleURL: bundleURL?.first)
+        
+        Self.logInit(kind: "bare‑pid",
+                     pid: pid,
+                     name: name,
+                     bundleID: bundleID,
+                     parent: parentURL)
+        
+        self.init(corePID         : pid,
+                  name            : name,
+                  bundleID        : bundleID?.isEmpty == true ? nil : bundleID,
+                  bundleURL       : bundleURL?.first,
+                  parentBundleURL : parentURL,
+                  objectID        : objectID,
+                  kind            : bundleURL?.first?.isApp == true ? .app : .process)
     }
 }
 
 // MARK: - Grouping
 
-extension AudioProcessGroup {
-    static func groups(with processes: [AudioProcess]) -> [AudioProcessGroup] {
-        var byKind = [AudioProcess.Kind: AudioProcessGroup]()
+//extension AudioProcessGroup {
+//    static func groups(with processes: [AudioProcess]) -> [AudioProcessGroup] {
+//        var byKind = [AudioProcess.Kind: AudioProcessGroup]()
+//
+//        for process in processes {
+//            byKind[process.kind, default: .init(for: process.kind)].processes.append(process)
+//        }
+//
+//        return byKind.values.sorted(by: { $0.title.localizedStandardCompare($1.title) == .orderedAscending })
+//    }
+//}
 
+extension AudioProcessGroup {
+    static func groups(
+        with processes: [AudioProcess],
+        onlyKnownKinds: Bool,
+        displayedGroups: Set<AudioProcess.Kind>
+    ) -> OrderedDictionary<AudioProcess.Kind, AudioProcessGroup> {
+        
+        // Group processes by kind, optionally filtering for known types only
+        var byKind = OrderedDictionary<AudioProcess.Kind, AudioProcessGroup>()
         for process in processes {
+            if !displayedGroups.contains(process.kind) { continue }
+            if onlyKnownKinds && process.knownType == nil { continue }
             byKind[process.kind, default: .init(for: process.kind)].processes.append(process)
         }
-
-        return byKind.values.sorted(by: { $0.title.localizedStandardCompare($1.title) == .orderedAscending })
+        
+        // Sort processes inside each group alphabetically (ascending)
+        for key in byKind.keys {
+            byKind[key]?.processes.sort {
+                $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+        }
+        
+        // Preserve predictable ordering of kinds via sortPriority
+        let sortedPairs = byKind.sorted { lhs, rhs in
+            lhs.key.sortPriority < rhs.key.sortPriority
+        }
+        
+        // Reconstruct ordered dictionary with the desired ordering
+        return OrderedDictionary(uniqueKeysWithValues: sortedPairs)
     }
 }
+
 
 extension AudioProcessGroup {
     init(for kind: AudioProcess.Kind) {
@@ -187,8 +394,8 @@ extension AudioProcessGroup {
 extension AudioProcess.Kind {
     var groupTitle: String {
         switch self {
-        case .process: "Processes"
-        case .app: "Apps"
+            case .process: "Processes"
+            case .app: "Apps"
         }
     }
 }
@@ -198,22 +405,22 @@ extension AudioProcess.Kind {
 private func processInfo(for pid: pid_t) -> (name: String, path: String)? {
     let nameBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(MAXPATHLEN))
     let pathBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(MAXPATHLEN))
-
+    
     defer {
         nameBuffer.deallocate()
         pathBuffer.deallocate()
     }
-
+    
     let nameLength = proc_name(pid, nameBuffer, UInt32(MAXPATHLEN))
     let pathLength = proc_pidpath(pid, pathBuffer, UInt32(MAXPATHLEN))
-
+    
     guard nameLength > 0, pathLength > 0 else {
         return nil
     }
-
+    
     let name = String(cString: nameBuffer)
     let path = String(cString: pathBuffer)
-
+    
     return (name, path)
 }
 
@@ -224,20 +431,28 @@ private extension String {
 }
 
 private extension URL {
-    func parentBundleURL(maxDepth: Int = 8) -> URL? {
-        var depth = 0
-        var url = deletingLastPathComponent()
-        while depth < maxDepth, !url.isBundle {
-            url = url.deletingLastPathComponent()
+    /// Walks up the directory tree (up to `maxDepth` levels) and returns the
+    /// highest‑level `.app` bundle encountered. This avoids choosing nested
+    /// Helper/Plugin bundles that live inside `Frameworks/Helpers`.
+    func topmostAppBundleURL(maxDepth: Int = 10) -> URL? {
+        var depth       = 0
+        var node        = self            // start at the original URL
+        var candidate: URL? = nil         // last seen .app bundle
+        
+        while depth < maxDepth {
+            if node.isApp { candidate = node }
+            let parent = node.deletingLastPathComponent()
+            if parent == node { break }   // reached filesystem root
+            node  = parent
             depth += 1
         }
-        return url.isBundle ? url : nil
+        return candidate
     }
-
+    
     var isBundle: Bool {
         (try? resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .bundle) == true
     }
-
+    
     var isApp: Bool {
         (try? resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .application) == true
     }
