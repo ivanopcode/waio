@@ -1,7 +1,8 @@
 import SwiftUI
 import AudioToolbox
 import OSLog
-import AVFoundation
+@preconcurrency import AVFoundation
+@preconcurrency import AVFAudio
 
 @Observable
 final class ProcessTap {

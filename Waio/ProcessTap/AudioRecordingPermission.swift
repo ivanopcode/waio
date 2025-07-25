@@ -79,7 +79,7 @@ final class AudioRecordingPermission {
     private typealias RequestFuncType = @convention(c) (CFString, CFDictionary?, @escaping (Bool) -> Void) -> Void
 
     /// `dlopen` handle to the TCC framework.
-    private static let apiHandle: UnsafeMutableRawPointer? = {
+    private nonisolated(unsafe) static let apiHandle: UnsafeMutableRawPointer? = {
         let tccPath = "/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC"
 
         guard let handle = dlopen(tccPath, RTLD_NOW) else {
