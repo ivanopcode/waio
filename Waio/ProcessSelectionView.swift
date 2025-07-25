@@ -112,7 +112,7 @@ extension URL {
     static var applicationSupport: URL {
         do {
             let appSupport = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-            let subdir = appSupport.appending(path: "AudioCap", directoryHint: .isDirectory)
+            let subdir = appSupport.appending(path: "Waio", directoryHint: .isDirectory)
             if !FileManager.default.fileExists(atPath: subdir.path) {
                 try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
             }

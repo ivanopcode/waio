@@ -67,7 +67,7 @@
 				AA489F1F2E32D0ED00AB7BC5 /* Waio */,
 			);
 			name = Waio;
-			productName = AudioCap;
+			productName = Waio;
 			productReference = F47AD93E2BF5B61E005B75AC /* Waio.app */;
 			productType = "com.apple.product-type.application";
 		};
@@ -268,9 +268,10 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Waio/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Waio;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Record audio";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Please authorize this application to access your microphone for audio recording.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -300,9 +301,10 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Waio/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Waio;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Record audio";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Please authorize this application to access your microphone for audio recording.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

@@ -1,9 +1,9 @@
 import SwiftUI
 
-let kAppSubsystem = "codes.rambo.AudioCap"
+let kAppSubsystem = "do.waio.app-ios"
 
 @main
-struct AudioCapApp: App {
+struct WaioApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
