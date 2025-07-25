@@ -3,6 +3,7 @@ import AudioToolbox
 import OSLog
 import Combine
 import OrderedCollections
+import Darwin
 
 struct AudioProcess: Identifiable, Hashable, Sendable {
     enum Kind: String, Sendable {
@@ -127,15 +128,56 @@ final class AudioProcessController: ObservableObject {
             let objectIdentifiers = try AudioObjectID.readProcessList()
             
             let updatedProcesses: [AudioProcess] = objectIdentifiers.compactMap { objectID in
+                // Always try to obtain pid and uid first
+                guard
+                    let pid: pid_t = try? objectID.read(kAudioProcessPropertyPID, defaultValue: -1)
+                else { return nil }
+                
+                let maybeUID = uid(for: pid)
+                
+                // If UID could not be determined → log & skip
+                if maybeUID == nil {
+                    let fallBackName = processInfo(for: pid)?.name ?? "Unknown"
+                    AudioProcess.logInit(kind: "ignored",
+                                         pid: pid,
+                                         name: fallBackName,
+                                         bundleID: objectID.readProcessBundleID(),
+                                         parent: nil,
+                                         procUID: nil,
+                                         ignored: true)
+                    return nil
+                }
+                
+                let otherUID = maybeUID!
+                
+                // Skip and log if UID does not match current user
+                if otherUID != kCurrentUID {
+                    let ignoredName = processInfo(for: pid)?.name ?? "Unknown"
+                    AudioProcess.logInit(kind: "ignored",
+                                         pid: pid,
+                                         name: ignoredName,
+                                         bundleID: objectID.readProcessBundleID(),
+                                         parent: nil,
+                                         procUID: otherUID,
+                                         ignored: true)
+                    return nil
+                }
                 do {
                     let proc = try AudioProcess(objectID: objectID, runningApplications: apps)
                     
-#if DEBUG
-                    if UserDefaults.standard.bool(forKey: "ACDumpProcessInfo") {
-                        //. logger.debug("[PROCESS] \(String(describing: proc))")
-                    }
-#endif
+                    // Determine if this process will be excluded later
+                    let willBeIgnored = (!displayedGroups.contains(proc.kind)) ||
+                    (onlyKnownKinds && proc.knownType == nil)
                     
+                    AudioProcess.logInit(kind: willBeIgnored ? "ignored" : "detected",
+                                         pid: proc.id,
+                                         name: proc.name,
+                                         bundleID: proc.bundleID,
+                                         parent: proc.parentAppBundleURL,
+                                         procUID: kCurrentUID,
+                                         ignored: willBeIgnored)
+                    
+                    if willBeIgnored { return nil }
                     return proc
                 } catch {
                     logger.warning("Failed to initialize process with object ID #\(objectID, privacy: .public): \(error, privacy: .public)")
@@ -156,6 +198,20 @@ final class AudioProcessController: ObservableObject {
         }
     }
     
+}
+
+// MARK: - UID Helpers (same‑user filtering)
+
+fileprivate let kCurrentUID: uid_t = geteuid()
+
+/// Returns the effective UID of the process identified by `pid`, or `nil` if it
+/// can’t be read.
+fileprivate func uid(for pid: pid_t) -> uid_t? {
+    var info = proc_bsdinfo()
+    let size = MemoryLayout.size(ofValue: info)
+    let k = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(size))
+    guard k == size else { return nil }
+    return info.pbi_uid
 }
 
 private extension AudioProcess {
@@ -231,14 +287,22 @@ private extension AudioProcess {
                         pid: pid_t,
                         name: String,
                         bundleID: String?,
-                        parent: URL?) {
+                        parent: URL?,
+                        procUID: uid_t? = nil,
+                        ignored: Bool = false)
+    {
+        let uidStr      = procUID.map(String.init) ?? "–"
+        let ignoredFlag = ignored ? "yes" : "no"
+        
         initLogger.debug(
-          """
-          \(fixed(kind,width:12)) | pid \(pid,format:.decimal,align:.right(columns:6),privacy:.public) \
-          | name \(fixed(name,width:28)) \
-          | bundleID \(fixed(bundleID,width:38)) \
-          | parent \(fixed(parent?.lastPathComponent,width:18))
-          """
+      """
+      \(fixed(kind,width:12)) | pid \(pid,format:.decimal,align:.right(columns:6),privacy:.public) \
+      | user \(fixed(uidStr,width:6)) \
+      | ignnored \(fixed(ignoredFlag,width:3)) \
+      | name \(fixed(name,width:28)) \
+      | bundleID \(fixed(bundleID,width:38)) \
+      | parent \(fixed(parent?.lastPathComponent,width:18))
+      """
         )
     }
     
@@ -278,11 +342,12 @@ private extension AudioProcess {
                                                    bundleURL: app.bundleURL,
                                                    suffixes: parentBundleSuffixes)
         
-        Self.logInit(kind: "helper‑app",
+        Self.logInit(kind: "helper-app",
                      pid: app.processIdentifier,
                      name: name,
                      bundleID: app.bundleIdentifier,
-                     parent: parentURL)
+                     parent: parentURL,
+                     procUID: uid(for: app.processIdentifier) ?? kCurrentUID)
         
         self.init(corePID         : app.processIdentifier,
                   name            : name,
@@ -298,9 +363,10 @@ private extension AudioProcess {
         let pid: pid_t = try objectID.read(kAudioProcessPropertyPID, defaultValue: -1)
         Self.logInit(kind: "objectID→apps",
                      pid: pid,
-                     name: "",          // not applicable
+                     name: "",
                      bundleID: nil,
-                     parent: nil)
+                     parent: nil,
+                     procUID: kCurrentUID)
         
         if let app = apps.first(where: { $0.processIdentifier == pid }) {
             self.init(app: app, objectID: objectID)
@@ -322,11 +388,12 @@ private extension AudioProcess {
         let parentURL = Self.inferParentBundleURL(bundleID: bundleID,
                                                   bundleURL: bundleURL?.first)
         
-        Self.logInit(kind: "bare‑pid",
+        Self.logInit(kind: "bare-pid",
                      pid: pid,
                      name: name,
                      bundleID: bundleID,
-                     parent: parentURL)
+                     parent: parentURL,
+                     procUID: kCurrentUID)
         
         self.init(corePID         : pid,
                   name            : name,
