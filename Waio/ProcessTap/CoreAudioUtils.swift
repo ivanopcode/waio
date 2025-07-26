@@ -125,6 +125,24 @@ extension AudioObjectID {
 // MARK: - Generic Property Access
 
 extension AudioObjectID {
+    
+    /// Returns an array of AudioDeviceIDs.
+    static func readDeviceList() throws -> [AudioDeviceID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        var err = AudioObjectGetPropertyDataSize(Self.system, &address, 0, nil, &dataSize)
+        guard err == noErr else { throw "Error reading device data size: \(err)" }
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.stride
+        var deviceIDs = [AudioDeviceID](repeating: .unknown, count: count)
+        err = AudioObjectGetPropertyData(Self.system, &address, 0, nil, &dataSize, &deviceIDs)
+        guard err == noErr else { throw "Error reading device array: \(err)" }
+        return deviceIDs.filter { $0.isValid }
+    }
+    
     func read<T, Q>(_ selector: AudioObjectPropertySelector,
                     scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
                     element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain,
