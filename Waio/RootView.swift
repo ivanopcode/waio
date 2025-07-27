@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Foundation
+import AppKit                          // ← needed for NSAlert
 
 @MainActor
 struct RootView: View {
@@ -10,10 +11,15 @@ struct RootView: View {
     
     // Trigger used to start both recorders simultaneously
     @State private var startSignal = UUID()
-    @State private var stopSignal = UUID()
+    @State private var stopSignal  = UUID()
     @State private var isProcessRecording = false
     @State private var isDeviceRecording  = false
     
+    /// `true` after we have successfully shown the system‑audio permission sheet once
+    /// this is because apple there’s no public API to request audio recording permission
+    /// or to check if the app has that permission.
+    @State private var didPrimeSystemAudioPermission =
+    UserDefaults.standard.bool(forKey: "didPrimeSystemAudioPermission")
     
     /// Shared base name for both recordings
     @State private var baseName: String = ""
@@ -22,11 +28,6 @@ struct RootView: View {
     // ── Body ────────────────────────────────────────────────────────────
     var body: some View {
         Form {
-            LabeledContent("Recording Name") {
-                TextField("", text: $baseName)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($isBaseNameFocused)
-            }
             switch permission.status {
                 case .unknown:
                     requestPermissionView
@@ -41,7 +42,19 @@ struct RootView: View {
                         case .denied, .restricted:
                             micPermissionDeniedView
                         case .authorized:
-                            recordingRootView
+                            // ── Actual capture UI ─────────────────────────────────────────
+                            if micPermissionStatus == .authorized && didPrimeSystemAudioPermission {
+                                // ── Recording name field ──────────────────────────────────
+                                LabeledContent("Recording Name") {
+                                    TextField("", text: $baseName)
+                                        .textFieldStyle(.roundedBorder)
+                                        .focused($isBaseNameFocused)
+                                }
+                                
+                                recordingRootView          // process/mic pickers & start/stop
+                            } else {
+                                recordingRootView
+                            }
                         @unknown default:
                             micPermissionRequestView
                     }
@@ -49,13 +62,11 @@ struct RootView: View {
         }
         .formStyle(.grouped)
         .onAppear {
-            if baseName.isEmpty {
-                baseName = makeRecordingBaseName()
-            }
+            if baseName.isEmpty { baseName = makeRecordingBaseName() }
         }
         .task {
             // Explicitly clear initial focus
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 s
             isBaseNameFocused = false
         }
     }
@@ -91,15 +102,34 @@ struct RootView: View {
     @ViewBuilder
     private var micPermissionDeniedView: some View {
         LabeledContent("Microphone Permission Required") {
-            Button("Open System Settings") {
-                NSWorkspace.shared.openSystemSettings()
-            }
+            Button("Open System Settings") { NSWorkspace.shared.openSystemSettings() }
         }
     }
     
     // ── Root view for both capture paths ────────────────────────────────
     @ViewBuilder
     private var recordingRootView: some View {
+        // ⓵ Explicit system‑audio permission priming
+        Section(header: Text("System Audio Permission").font(.headline)) {
+            Button(didPrimeSystemAudioPermission
+                   ? "Permission Granted ✔︎"
+                   : "Grant App‑Audio Permission")
+            {
+                Task {
+                    do {
+                        try await ProcessPermissionPrimer.prime()
+                        didPrimeSystemAudioPermission = true
+                        UserDefaults.standard.set(true,
+                                                  forKey: "didPrimeSystemAudioPermission")
+                    } catch {
+                        NSAlert(error: error).runModal()
+                    }
+                }
+            }
+            .disabled(didPrimeSystemAudioPermission)
+        }
+        
+        // ⓶ Normal recording UI
         Section(header: Text("Source").font(.headline)) {
             ProcessSelectionView(displayedGroups: [.app, .process],
                                  onlyKnownKinds: true,
@@ -117,43 +147,34 @@ struct RootView: View {
         }
         
         Section {
-            Button("Start Both") {
-                startSignal = UUID()
-            }
-            .disabled(isProcessRecording || isDeviceRecording)
+            Button("Start Both") { startSignal = UUID() }
+                .disabled(isProcessRecording || isDeviceRecording)
             
-            Button("Stop Both") {
-                stopSignal = UUID()
-            }
-            .disabled(!(isProcessRecording || isDeviceRecording))
+            Button("Stop Both")  { stopSignal = UUID() }
+                .disabled(!(isProcessRecording || isDeviceRecording))
         }
     }
     
 }
 
 /// Returns a filesystem‑safe default recording name like
-/// “2025-07-27_0446-waio”, where the time part respects the
-/// user’s 12‑/24‑hour locale preference.
+/// "2025‑07‑27_0446‑waio”.
 private func makeRecordingBaseName(date: Date = Date(),
-                                   suffix: String = "waio") -> String {
-    // ISO‑8601 date (yyyy‑MM‑dd)
+                                   suffix: String = "waio") -> String
+{
     let isoDateFormatter = ISO8601DateFormatter()
     isoDateFormatter.formatOptions = [.withFullDate]
     let datePart = isoDateFormatter.string(from: date)
     
-    // Localized time (12‑/24‑hour)
     let timeFormatter = DateFormatter()
     timeFormatter.locale = .current
     timeFormatter.timeZone = .current
-    
-    // “j” picks 12‑ vs 24‑hour automatically
     let timeTemplate = "jmm"          // hours + minutes
     let timeFormat = DateFormatter.dateFormat(fromTemplate: timeTemplate,
                                               options: 0,
                                               locale: .current) ?? "HHmm"
     timeFormatter.dateFormat = timeFormat
     
-    // Convert any separators to dashes so the string is safe for filenames
     var timePart = timeFormatter.string(from: date)
     timePart = timePart
         .replacingOccurrences(of: "/", with: "-")
@@ -162,6 +183,7 @@ private func makeRecordingBaseName(date: Date = Date(),
         .replacingOccurrences(of: " ", with: "-")
     
     return "\(datePart)_\(timePart)-\(suffix)"
+    
 }
 
 extension NSWorkspace {
@@ -173,9 +195,3 @@ extension NSWorkspace {
         openApplication(at: url, configuration: .init())
     }
 }
-
-#if DEBUG
-#Preview {
-    RootView()
-}
-#endif

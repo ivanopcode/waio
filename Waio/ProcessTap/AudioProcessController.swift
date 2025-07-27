@@ -219,7 +219,7 @@ fileprivate func uid(for pid: pid_t) -> uid_t? {
     return info.pbi_uid
 }
 
-private extension AudioProcess {
+extension AudioProcess {
     
     // ───────────────────────────── Helpers ─────────────────────────────
     
