@@ -1,144 +1,137 @@
 import SwiftUI
 import AVFoundation
 import Foundation
-import AppKit                          // ← needed for NSAlert
+import AppKit          // ← NSAlert / NSWorkspace
 
 @MainActor
 struct RootView: View {
-    // ── Permissions ─────────────────────────────────────────────────────
-    @State private var permission = AudioRecordingPermission()
-    @State private var micPermissionStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+    // ── Permissions ────────────────────────────────────────────────────
+    @State private var audioCapturePermission = AudioRecordingPermission()   // "Audio Capture" (system audio)
+    @State private var micPermissionStatus    = AVCaptureDevice.authorizationStatus(for: .audio)
     
-    // Trigger used to start both recorders simultaneously
+    /// `true` once we have successfully shown Apple’s "App‑Audio Recording" prompt
+    @State private var didPrimeSystemAudioPermission =
+    UserDefaults.standard.bool(forKey: "didPrimeSystemAudioPermission")
+    
+    /// All permissions required for the recording UI
+    private var allPermissionsGranted: Bool {
+        audioCapturePermission.status == .authorized &&
+        micPermissionStatus            == .authorized &&
+        didPrimeSystemAudioPermission
+    }
+    
+    // ── Recording‑sync state (unchanged) ───────────────────────────────
     @State private var startSignal = UUID()
     @State private var stopSignal  = UUID()
     @State private var isProcessRecording = false
     @State private var isDeviceRecording  = false
     
-    /// `true` after we have successfully shown the system‑audio permission sheet once
-    /// this is because apple there’s no public API to request audio recording permission
-    /// or to check if the app has that permission.
-    @State private var didPrimeSystemAudioPermission =
-    UserDefaults.standard.bool(forKey: "didPrimeSystemAudioPermission")
-    
-    /// Shared base name for both recordings
+    // Shared base name for files
     @State private var baseName: String = ""
     @FocusState private var isBaseNameFocused: Bool
     
     // ── Body ────────────────────────────────────────────────────────────
     var body: some View {
         Form {
-            switch permission.status {
-                case .unknown:
-                    requestPermissionView
-                    
-                case .denied:
-                    permissionDeniedView
-                    
-                case .authorized:
-                    switch micPermissionStatus {
-                        case .notDetermined:
-                            micPermissionRequestView
-                        case .denied, .restricted:
-                            micPermissionDeniedView
-                        case .authorized:
-                            // ── Actual capture UI ─────────────────────────────────────────
-                            if micPermissionStatus == .authorized && didPrimeSystemAudioPermission {
-                                // ── Recording name field ──────────────────────────────────
-                                LabeledContent("Recording Name") {
-                                    TextField("", text: $baseName)
-                                        .textFieldStyle(.roundedBorder)
-                                        .focused($isBaseNameFocused)
-                                }
-                                
-                                recordingRootView          // process/mic pickers & start/stop
-                            } else {
-                                recordingRootView
-                            }
-                        @unknown default:
-                            micPermissionRequestView
-                    }
+            if allPermissionsGranted {
+                recordingRootView                           // ← main capture UI
+            } else {
+                permissionsView                             // ← single combined screen
             }
         }
         .formStyle(.grouped)
         .onAppear {
             if baseName.isEmpty { baseName = makeRecordingBaseName() }
         }
+        // Refresh mic permission whenever app becomes active
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            micPermissionStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        }
         .task {
-            // Explicitly clear initial focus
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 s
+            // Explicitly clear initial text‑field focus on first launch
+            try? await Task.sleep(nanoseconds: 100_000_000)
             isBaseNameFocused = false
         }
     }
     
-    // ── Permission helper views ─────────────────────────────────────────
+    // ── Unified permission screen ──────────────────────────────────────
     @ViewBuilder
-    private var requestPermissionView: some View {
-        LabeledContent("Please Allow Audio Recording") {
-            Button("Allow") { permission.request() }
-        }
-    }
-    
-    @ViewBuilder
-    private var permissionDeniedView: some View {
-        LabeledContent("Audio Recording Permission Required") {
-            Button("Open System Settings") { NSWorkspace.shared.openSystemSettings() }
-        }
-    }
-    
-    @ViewBuilder
-    private var micPermissionRequestView: some View {
-        LabeledContent("Please Allow Microphone Access") {
-            Button("Allow") {
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    DispatchQueue.main.async {
-                        micPermissionStatus = granted ? .authorized : .denied
+    private var permissionsView: some View {
+        // Microphone permission ‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑
+        Section(header: Text("Microphone").font(.headline)) {
+            switch micPermissionStatus {
+                case .authorized:
+                    Label("Microphone access granted ✔︎", systemImage: "checkmark.circle")
+                case .notDetermined:
+                    Button("Allow Microphone Access") {
+                        AVCaptureDevice.requestAccess(for: .audio) { granted in
+                            DispatchQueue.main.async {
+                                micPermissionStatus = granted ? .authorized : .denied
+                            }
+                        }
                     }
-                }
+                case .denied, .restricted:
+                    Button("Open System Settings") { NSWorkspace.shared.openSystemSettings() }
+                @unknown default:
+                    EmptyView()
             }
-        }
-    }
-    
-    @ViewBuilder
-    private var micPermissionDeniedView: some View {
-        LabeledContent("Microphone Permission Required") {
-            Button("Open System Settings") { NSWorkspace.shared.openSystemSettings() }
-        }
-    }
-    
-    // ── Root view for both capture paths ────────────────────────────────
-    @ViewBuilder
-    private var recordingRootView: some View {
-        // ⓵ Explicit system‑audio permission priming
-        Section(header: Text("System Audio Permission").font(.headline)) {
-            Button(didPrimeSystemAudioPermission
-                   ? "Permission Granted ✔︎"
-                   : "Grant App‑Audio Permission")
-            {
-                Task {
-                    do {
-                        try await ProcessPermissionPrimer.prime()
-                        didPrimeSystemAudioPermission = true
-                        UserDefaults.standard.set(true,
-                                                  forKey: "didPrimeSystemAudioPermission")
-                    } catch {
-                        NSAlert(error: error).runModal()
-                    }
-                }
-            }
-            .disabled(didPrimeSystemAudioPermission)
         }
         
-        // ⓶ Normal recording UI
+        // System‑audio capture permission (TCC SPI) ───────────────
+        if audioCapturePermission.status != .authorized {
+            Section(header: Text("System Audio").font(.headline)) {
+                switch audioCapturePermission.status {
+                    case .unknown:
+                        Button("Allow System‑Audio Capture") { audioCapturePermission.request() }
+                    case .denied:
+                        Button("Open System Settings") { NSWorkspace.shared.openSystemSettings() }
+                    default:
+                        EmptyView()
+                }
+            }
+        }
+        
+        // One‑time priming of per‑process tap privilege ────────────────
+        if audioCapturePermission.status == .authorized &&
+            !didPrimeSystemAudioPermission {
+            Section(header: Text("App Audio Permission").font(.headline)) {
+                Button("Grant App‑Audio Permission") {
+                    Task {
+                        do {
+                            try await ProcessPermissionPrimer.prime()
+                            didPrimeSystemAudioPermission = true
+                            UserDefaults.standard.set(true,
+                                                      forKey: "didPrimeSystemAudioPermission")
+                        } catch {
+                            NSAlert(error: error).runModal()
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // ── Main recording UI (unchanged) ──────────────────────────────────
+    @ViewBuilder
+    private var recordingRootView: some View {
+        // Recording name
+        LabeledContent("Recording Name") {
+            TextField("", text: $baseName)
+                .textFieldStyle(.roundedBorder)
+                .focused($isBaseNameFocused)
+        }
+        
+        // Process picker
         Section(header: Text("Source").font(.headline)) {
             ProcessSelectionView(displayedGroups: [.app, .process],
                                  onlyKnownKinds: true,
-                                 startSignal: $startSignal,
-                                 stopSignal:  $stopSignal,
-                                 isRecording: $isProcessRecording,
-                                 baseName:    $baseName)
+                                 startSignal:   $startSignal,
+                                 stopSignal:    $stopSignal,
+                                 isRecording:   $isProcessRecording,
+                                 baseName:      $baseName)
         }
         
+        // Microphone picker
         Section(header: Text("Microphone").font(.headline)) {
             DeviceSelectionView(startSignal: $startSignal,
                                 stopSignal:  $stopSignal,
@@ -146,11 +139,12 @@ struct RootView: View {
                                 baseName:    $baseName)
         }
         
+        // Start / Stop buttons
         Section {
             Button("Start Both") { startSignal = UUID() }
                 .disabled(isProcessRecording || isDeviceRecording)
             
-            Button("Stop Both")  { stopSignal = UUID() }
+            Button("Stop Both")  { stopSignal  = UUID() }
                 .disabled(!(isProcessRecording || isDeviceRecording))
         }
     }
@@ -158,7 +152,7 @@ struct RootView: View {
 }
 
 /// Returns a filesystem‑safe default recording name like
-/// "2025‑07‑27_0446‑waio”.
+/// "2025‑07‑27_0446‑waio".
 private func makeRecordingBaseName(date: Date = Date(),
                                    suffix: String = "waio") -> String
 {
@@ -169,23 +163,18 @@ private func makeRecordingBaseName(date: Date = Date(),
     let timeFormatter = DateFormatter()
     timeFormatter.locale = .current
     timeFormatter.timeZone = .current
-    let timeTemplate = "jmm"          // hours + minutes
-    let timeFormat = DateFormatter.dateFormat(fromTemplate: timeTemplate,
-                                              options: 0,
-                                              locale: .current) ?? "HHmm"
-    timeFormatter.dateFormat = timeFormat
+    timeFormatter.dateFormat = DateFormatter.dateFormat(fromTemplate: "jmm",
+                                                        options: 0,
+                                                        locale: .current) ?? "HHmm"
     
-    var timePart = timeFormatter.string(from: date)
-    timePart = timePart
-        .replacingOccurrences(of: "/", with: "-")
-        .replacingOccurrences(of: ":", with: "-")
-        .replacingOccurrences(of: ".", with: "-")
-        .replacingOccurrences(of: " ", with: "-")
+    let timePart = timeFormatter.string(from: date)
+        .replacingOccurrences(of: "[/ :.]", with: "-", options: .regularExpression)
     
     return "\(datePart)_\(timePart)-\(suffix)"
     
 }
 
+// Helper to open System Settings exactly once
 extension NSWorkspace {
     func openSystemSettings() {
         guard let url = urlForApplication(withBundleIdentifier: "com.apple.systempreferences") else {

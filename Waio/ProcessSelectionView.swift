@@ -87,6 +87,8 @@ struct ProcessSelectionView: View {
                     } catch {
                         logger.error("Process recorder failed to start: \(error, privacy: .public)")
                     }
+                } else {
+                    logger.error("Recorder in process recorder not set")
                 }
             }
             .onChange(of: stopSignal) { _, _ in
