@@ -1,8 +1,16 @@
+
 import SwiftUI
 import AudioToolbox
 import OSLog
 @preconcurrency import AVFoundation
 @preconcurrency import AVFAudio
+
+// ── Compatibility shim (for SDKs prior to macOS 15) ─────────────────────────
+/// New in macOS 15: lets the tap deliver digital‑silence buffers while the
+/// host process is idle.  On older SDKs the symbol is absent, so we define
+/// it manually; Core Audio simply ignores unknown keys at runtime.
+private let kAudioSubTapProvidesSilenceWhenHostProcessIsSilentKey: CFString =
+"kAudioSubTapProvidesSilenceWhenHostProcessIsSilentKey" as CFString
 
 @Observable
 final class ProcessTap {
@@ -107,53 +115,56 @@ final class ProcessTap {
     private func prepare(for objectID: AudioObjectID) throws {
         errorMessage = nil
         
-        let tapDescription = CATapDescription(stereoMixdownOfProcesses: [objectID])
+        var tapDescription = CATapDescription(stereoMixdownOfProcesses: [objectID])
         tapDescription.uuid = UUID()
         tapDescription.muteBehavior = muteWhenRunning ? .mutedWhenTapped : .unmuted
+        
         var tapID: AUAudioObjectID = .unknown
         var err = AudioHardwareCreateProcessTap(tapDescription, &tapID)
-        
-        guard err == noErr else {
+        if err != noErr {
             errorMessage = "Process tap creation failed with error \(err)"
             return
         }
         
         logger.debug("Created process tap #\(tapID, privacy: .public)")
+        processTapID = tapID
         
-        self.processTapID = tapID
-        
+        // Aggregate‑device plumbing
         let systemOutputID = try AudioDeviceID.readDefaultSystemOutputDevice()
         let outputUID      = try systemOutputID.readDeviceUID()
         let aggregateUID   = UUID().uuidString
         
         let description: [String: Any] = [
-            kAudioAggregateDeviceNameKey:           "Tap-\(process.id)",
-            kAudioAggregateDeviceUIDKey:            aggregateUID,
-            kAudioAggregateDeviceMainSubDeviceKey:  outputUID,
-            kAudioAggregateDeviceIsPrivateKey:      true,
-            kAudioAggregateDeviceIsStackedKey:      false,
-            kAudioAggregateDeviceTapAutoStartKey:   true,
-            kAudioAggregateDeviceSubDeviceListKey:  [
+            kAudioAggregateDeviceNameKey:          "Tap-\(process.id)",
+            kAudioAggregateDeviceUIDKey:           aggregateUID,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceIsPrivateKey:     true,
+            kAudioAggregateDeviceIsStackedKey:     false,
+            kAudioAggregateDeviceTapAutoStartKey:  true,
+            
+            // Keep the original output as the sole sub‑device
+            kAudioAggregateDeviceSubDeviceListKey: [
                 [ kAudioSubDeviceUIDKey: outputUID ]
             ],
-            kAudioAggregateDeviceTapListKey : [
+            
+            // Attach our tap – make it *emit silence* when host process is silent
+            kAudioAggregateDeviceTapListKey: [
                 [
-                    kAudioSubTapDriftCompensationKey: true,
-                    kAudioSubTapUIDKey:              tapDescription.uuid.uuidString
+                    kAudioSubTapDriftCompensationKey:             true,
+                    kAudioSubTapUIDKey:                           tapDescription.uuid.uuidString,
+                    kAudioSubTapProvidesSilenceWhenHostProcessIsSilentKey: true
                 ]
             ]
         ]
         
-        self.tapStreamDescription = try tapID.readAudioTapStreamBasicDescription()
+        tapStreamDescription = try tapID.readAudioTapStreamBasicDescription()
         registerFormatChangeListener()
         
         aggregateDeviceID = .unknown
         err = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateDeviceID)
-        guard err == noErr else {
-            throw "Failed to create aggregate device: \(err)"
-        }
-        
-        logger.debug("Created aggregate device #\(self.aggregateDeviceID, privacy: .public)")
+        guard err == noErr else { throw "Failed to create aggregate device: \(err)" }
+        let aggregateDeviceID = aggregateDeviceID
+        logger.debug("Created aggregate device #\(aggregateDeviceID, privacy: .public)")
     }
     
     func run(on queue: DispatchQueue,
@@ -212,6 +223,9 @@ final class ProcessTapRecorder {
     
     // Persistent timing state for effective‑sample‑rate measurement
     @ObservationIgnored private var lastHostTime: UInt64 = 0
+    @ObservationIgnored private var startHostTime: UInt64 = 0
+    /// We skip padding for micro‑gaps shorter than this at the output rate.
+    private let minGapFramesOut: AVAudioFrameCount = 32
     
     // Mach‑time tick conversion factor
     private static let hostTicksPerSecond: Double = {
@@ -346,6 +360,9 @@ final class ProcessTapRecorder {
                                    commonFormat: .pcmFormatFloat32,
                                    interleaved: false)
         self.currentFile = file
+        // initialise real‑time baseline
+        self.startHostTime = mach_absolute_time()
+        self.lastHostTime  = self.startHostTime
         
         // MARK: Core Audio I/O Block
         try tap.run(on: queue) { [weak self] inNow, inInputData, inInputTime, outOutputData, inOutputTime in
@@ -368,9 +385,18 @@ final class ProcessTapRecorder {
                   let currentFile = self.currentFile
             else { return }
             
+            // --- Real‑time gap detection ---------------------------------
+            let nowHost = inInputTime.pointee.mHostTime
+            let deltaSec = Double(nowHost - self.lastHostTime) / Self.hostTicksPerSecond
+            let expectedIn = deltaSec * self.converterInputSampleRate
+            let gapIn = expectedIn - Double(buffer.frameLength)
+            let gapSec = max(0, gapIn / self.converterInputSampleRate)
+            self.lastHostTime = nowHost
+            // ----------------------------------------------------------------
+            
             // --- Effective sample‑rate measurement ---------------------------------
             var effectiveSR = self.converterInputSampleRate
-            let thisHostTime = inInputTime.pointee.mHostTime
+            let thisHostTime = nowHost
             if self.lastHostTime != 0, thisHostTime > self.lastHostTime {
                 effectiveSR = Double(buffer.frameLength) /
                 (Double(thisHostTime - self.lastHostTime) / Self.hostTicksPerSecond)
@@ -384,9 +410,9 @@ final class ProcessTapRecorder {
                     self.smoothedEffectiveSampleRate * (1 - self.smoothingAlpha) +
                     effectiveSR * self.smoothingAlpha
                 }
-                self.lastHostTime = thisHostTime
+                // self.lastHostTime = thisHostTime -- already set above
             } else {
-                self.lastHostTime = thisHostTime
+                // self.lastHostTime = thisHostTime -- already set above
             }
             // -----------------------------------------------------------------------
             
@@ -422,9 +448,23 @@ final class ProcessTapRecorder {
             }
             
             // Offload disk I/O to the writer queue to keep the audio callback real‑time safe
-            self.writerQueue.async(execute: { [weak self, ownedBuffer, capturedEffSR] in
-                guard let self,
+            self.writerQueue.async(execute: { [weak self, ownedBuffer, capturedEffSR, gapSec] in
+                // -------------------------------------------------------------------
+                // Ensure `self` is still alive before touching any properties.
+                // -------------------------------------------------------------------
+                guard let self = self,
                       let tgtFormat = self.targetFormat else { return }
+                
+                // ❶ Inject digital silence for any detected gap
+                if gapSec > 0 {
+                    let gapFrames = AVAudioFrameCount(round(gapSec * tgtFormat.sampleRate))
+                    if gapFrames >= self.minGapFramesOut,
+                       let silent = AVAudioPCMBuffer(pcmFormat: tgtFormat,
+                                                     frameCapacity: gapFrames) {
+                        silent.frameLength = gapFrames   // buffer already zero‑filled
+                        try? self.currentFile?.write(from: silent)
+                    }
+                }
                 
                 // --- Snap to nearest nominal rate and rebuild converter for stable SRC ---
                 let nominalSR = Self.nearestNominal(capturedEffSR)
@@ -506,6 +546,7 @@ final class ProcessTapRecorder {
             
             guard isRecording else { return }
             
+            flushTrailingSilence()
             currentFile = nil
             isRecording = false
             
@@ -513,6 +554,20 @@ final class ProcessTapRecorder {
         } catch {
             logger.error("Stop failed: \(error, privacy: .public)")
         }
+    }
+    
+    /// Pads the tail of the file with zeros so duration matches wall‑clock.
+    private func flushTrailingSilence() {
+        guard let tgt = targetFormat,
+              let file = currentFile else { return }
+        
+        let deltaSec = Double(mach_absolute_time() - lastHostTime) / Self.hostTicksPerSecond
+        let frames   = AVAudioFrameCount(round(deltaSec * tgt.sampleRate))
+        guard frames >= minGapFramesOut,
+              let silent = AVAudioPCMBuffer(pcmFormat: tgt, frameCapacity: frames) else { return }
+        
+        silent.frameLength = frames
+        try? file.write(from: silent)
     }
     
     private func handleInvalidation() {
