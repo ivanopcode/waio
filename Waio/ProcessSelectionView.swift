@@ -8,17 +8,33 @@ struct ProcessSelectionView: View {
     @State private var recorder: ProcessTapRecorder?
     
     @State private var selectedProcess: AudioProcess?
+    /// Signal used by RootView to start recording simultaneously with the device recorder
+    @Binding private var startSignal: UUID
+    @Binding private var stopSignal: UUID
+    /// Binds to RootView's process-recording state.
+    @Binding private var isRecording: Bool
+    /// Shared base name coming from RootView (ISO8601‑waio or user override)
+    @Binding private var baseName: String
     
     private let logger = Logger(subsystem: kAppSubsystem, category: "ProcessSelectionView")
     
     
-    init(displayedGroups: Set<AudioProcess.Kind>, onlyKnownKinds: Bool) {
+    init(displayedGroups: Set<AudioProcess.Kind>,
+         onlyKnownKinds: Bool,
+         startSignal: Binding<UUID>,
+         stopSignal:  Binding<UUID>,
+         isRecording: Binding<Bool>,
+         baseName:    Binding<String>) {
         self._processController = StateObject(
             wrappedValue: AudioProcessController(
                 displayedGroups: displayedGroups,
                 onlyKnownKinds: onlyKnownKinds
             )
         )
+        self._startSignal = startSignal
+        self._stopSignal = stopSignal
+        self._isRecording = isRecording
+        self._baseName = baseName
     }
     
     
@@ -63,6 +79,22 @@ struct ProcessSelectionView: View {
                     teardownTap()
                 }
             }
+            .onChange(of: startSignal) { _, _ in
+                if let recorder, !recorder.isRecording {
+                    do {
+                        try recorder.start()
+                        self.isRecording = true
+                    } catch {
+                        logger.error("Process recorder failed to start: \(error, privacy: .public)")
+                    }
+                }
+            }
+            .onChange(of: stopSignal) { _, _ in
+                if let recorder, recorder.isRecording {
+                    recorder.stop()
+                    self.isRecording = false
+                }
+            }
         } header: {
             Text("Source")
                 .font(.headline)
@@ -77,6 +109,7 @@ struct ProcessSelectionView: View {
                 RecordingView(recorder: recorder)
                     .onChange(of: recorder.isRecording) { wasRecording, isRecording in
                         /// Each recorder instance can only record a single file, so we create a new file/recorder when recording stops.
+                        self.isRecording = isRecording
                         if wasRecording, !isRecording {
                             createRecorder()
                         }
@@ -91,12 +124,17 @@ struct ProcessSelectionView: View {
         newTap.activate()
         
         createRecorder()
+        self.isRecording = false
     }
     
     private func createRecorder() {
         guard let tap else { return }
         
-        let filename = "\(tap.process.name)-\(Int(Date.now.timeIntervalSinceReferenceDate))"
+        // Construct filename: <baseName>-<processName>-<timestamp>.wav
+        let timestamp = Int(Date.now.timeIntervalSinceReferenceDate)
+        let safeBase  = baseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix    = safeBase.isEmpty ? tap.process.name : safeBase
+        let filename  = "\(prefix)-output-\(tap.process.name.lowercased())"
         let audioFileURL = URL.applicationSupport.appendingPathComponent(filename, conformingTo: .wav)
         
         let newRecorder = ProcessTapRecorder(fileURL: audioFileURL, tap: tap)
@@ -104,6 +142,7 @@ struct ProcessSelectionView: View {
     }
     
     private func teardownTap() {
+        self.isRecording = false
         tap = nil
     }
 }
@@ -125,3 +164,15 @@ extension URL {
     }
 }
 
+#if DEBUG
+struct ProcessSelectionView_Previews: PreviewProvider {
+    static var previews: some View {
+        ProcessSelectionView(displayedGroups: [.app, .process],
+                             onlyKnownKinds: true,
+                             startSignal: .constant(UUID()),
+                             stopSignal:  .constant(UUID()),
+                             isRecording: .constant(false),
+                             baseName:    .constant(""))
+    }
+}
+#endif
