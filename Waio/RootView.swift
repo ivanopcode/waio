@@ -33,6 +33,10 @@ struct RootView: View {
     /// Async task that waits for recorders to finish and then merges the artefacts.
     @State private var mergeTask: Task<Void, Never>? = nil
     
+    // Latest merged artefacts
+    @State private var lastStereoURL: URL?
+    @State private var lastMonoURL:   URL?
+    
     // ── Body ────────────────────────────────────────────────────────────
     var body: some View {
         Form {
@@ -159,14 +163,26 @@ struct RootView: View {
                     await MainActor.run {
                         if let (procURL, micURL) = latestRecordingURLs() {
                             combineLatestArtifacts(processURL: procURL,
-                                                        micURL:      micURL,
-                                                        baseName:    baseName
+                                                   micURL:      micURL,
+                                                   baseName:    baseName
                             )
                         }
                     }
                 }
             }
             .disabled(!(isProcessRecording || isDeviceRecording))
+        }
+        
+        // Latest merged files
+        if lastStereoURL != nil || lastMonoURL != nil {
+            Section(header: Text("Merged Output").font(.headline)) {
+                if let url = lastStereoURL {
+                    FileProxyView(url: url)
+                }
+                if let url = lastMonoURL {
+                    FileProxyView(url: url)
+                }
+            }
         }
     }
     
@@ -185,6 +201,10 @@ struct RootView: View {
                 
                 // 👉🏻 handle UI update, share sheet, etc.
                 print("New artefacts:", stereoURL.lastPathComponent, monoURL.lastPathComponent)
+                await MainActor.run {
+                    self.lastStereoURL = stereoURL
+                    self.lastMonoURL   = monoURL
+                }
             }
             catch {
                 assertionFailure("Merge failed: \(error)")

@@ -40,8 +40,8 @@ enum StereoMergeService {
     -> (stereoURL: URL, monoURL: URL) {
         
         let outDir     = processURL.deletingLastPathComponent()
-        let stereoURL  = outDir.appendingPathComponent("\(baseName)-split.wav")
-        let monoURL    = outDir.appendingPathComponent("\(baseName)-split-mono.wav")
+        let stereoURL  = outDir.appendingPathComponent("\(baseName)-merged.wav")
+        let monoURL    = outDir.appendingPathComponent("\(baseName)-merged-mono.wav")
         
         let log = Logger(subsystem: kAppSubsystem, category: "StereoMergeService")
         log.debug("▶︎ merge request – proc: \(processURL.lastPathComponent, privacy: .public), mic: \(micURL.lastPathComponent, privacy: .public)")
