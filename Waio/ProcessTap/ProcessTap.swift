@@ -387,7 +387,12 @@ final class ProcessTapRecorder {
             
             // --- Real‑time gap detection ---------------------------------
             let nowHost = inInputTime.pointee.mHostTime
-            let deltaSec = Double(nowHost - self.lastHostTime) / Self.hostTicksPerSecond
+            // Use a signed difference to avoid trapping on wrap‑around or clock jitter
+            let deltaTicks: UInt64 = nowHost >= self.lastHostTime
+            ? nowHost - self.lastHostTime
+            : 0                       // if clock moved backwards, treat as zero gap
+            
+            let deltaSec = Double(deltaTicks) / Self.hostTicksPerSecond
             let expectedIn = deltaSec * self.converterInputSampleRate
             let gapIn = expectedIn - Double(buffer.frameLength)
             let gapSec = max(0, gapIn / self.converterInputSampleRate)

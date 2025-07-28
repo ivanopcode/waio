@@ -30,6 +30,9 @@ struct RootView: View {
     @State private var baseName: String = ""
     @FocusState private var isBaseNameFocused: Bool
     
+    /// Async task that waits for recorders to finish and then merges the artefacts.
+    @State private var mergeTask: Task<Void, Never>? = nil
+    
     // ── Body ────────────────────────────────────────────────────────────
     var body: some View {
         Form {
@@ -144,8 +147,48 @@ struct RootView: View {
             Button("Start Both") { startSignal = UUID() }
                 .disabled(isProcessRecording || isDeviceRecording)
             
-            Button("Stop Both")  { stopSignal  = UUID() }
-                .disabled(!(isProcessRecording || isDeviceRecording))
+            Button("Stop Both") {
+                stopSignal = UUID()
+                
+                // Wait a moment for both recorders to flush, then merge artefacts.
+                mergeTask?.cancel()
+                mergeTask = Task.detached(priority: .utility) { [baseName] in
+                    // Give recorders time to flush to disk
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    // Hop back to the main actor for UI/state
+                    await MainActor.run {
+                        if let (procURL, micURL) = latestRecordingURLs() {
+                            combineLatestArtifacts(processURL: procURL,
+                                                        micURL:      micURL,
+                                                        baseName:    baseName
+                            )
+                        }
+                    }
+                }
+            }
+            .disabled(!(isProcessRecording || isDeviceRecording))
+        }
+    }
+    
+    /// Combines the latest process + mic recordings into split + mono files.
+    func combineLatestArtifacts(processURL: URL,
+                                micURL: URL,
+                                baseName: String)
+    {
+        Task {
+            do {
+                try? await Task.sleep(nanoseconds: 100_000_000) // just in case
+                let (stereoURL, monoURL) = try await StereoMergeService.merge(
+                    processURL: processURL,
+                    micURL:     micURL,
+                    baseName:   baseName)
+                
+                // 👉🏻 handle UI update, share sheet, etc.
+                print("New artefacts:", stereoURL.lastPathComponent, monoURL.lastPathComponent)
+            }
+            catch {
+                assertionFailure("Merge failed: \(error)")
+            }
         }
     }
     
@@ -172,6 +215,34 @@ private func makeRecordingBaseName(date: Date = Date(),
     
     return "\(datePart)_\(timePart)-\(suffix)"
     
+}
+
+// MARK: – Post‑processing helpers
+private extension RootView {
+    private func latestRecordingURLs() -> (processURL: URL, micURL: URL)? {
+        let dir = URL.applicationSupport
+        let fm  = FileManager.default
+        guard let listing = try? fm.contentsOfDirectory(at: dir,
+                                                        includingPropertiesForKeys: [.contentModificationDateKey],
+                                                        options: .skipsHiddenFiles)
+        else { return nil }
+        
+        let prefix = baseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let outputs = listing.filter { $0.lastPathComponent.hasPrefix(prefix) && $0.lastPathComponent.contains("-output-") && $0.pathExtension.lowercased() == "wav" }
+        let inputs  = listing.filter { $0.lastPathComponent.hasPrefix(prefix) && $0.lastPathComponent.contains("-input-")  && $0.pathExtension.lowercased() == "wav" }
+        
+        guard
+            let procURL = outputs.sorted(by: { ($0.modDate ?? .distantPast) > ($1.modDate ?? .distantPast) }).first,
+            let micURL  = inputs .sorted(by: { ($0.modDate ?? .distantPast) > ($1.modDate ?? .distantPast) }).first
+        else { return nil }
+        return (procURL, micURL)
+    }
+}
+
+private extension URL {
+    var modDate: Date? {
+        (try? resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
 }
 
 // Helper to open System Settings exactly once

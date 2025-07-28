@@ -67,9 +67,31 @@ final class AudioDeviceRecorder {
         
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
+        
+        // Wait for any pending writes to finish
+        writerQueue.sync { }
+        
+        // Explicitly close so the header is rewritten with the final length
+        if #available(macOS 15.0, *) {
+            outputFile?.close()
+            dumpFileInfo(fileURL, label: "MIC after stop()")
+        } else {
+            // Fallback on earlier versions
+        }          // available on macOS 15+, nop on older
         outputFile = nil
+        
         isRecording = false
         logger.info("⏹️ Stopped recording")
+    }
+    
+    func dumpFileInfo(_ url: URL, label: String) {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? UInt64 ?? 0
+        do {
+            let f = try AVAudioFile(forReading: url)
+            logger.debug("\(label) — bytes: \(size, privacy: .public)  frames: \(f.length, privacy: .public)  format: \(String(describing: f.processingFormat), privacy: .public)")
+        } catch {
+            logger.error("\(label) — could NOT open file: \(error, privacy: .public)")
+        }
     }
     
     // MARK: ‑ Engine / Tap setup ----------------------------------------
